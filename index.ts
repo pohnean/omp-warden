@@ -90,6 +90,22 @@ export function describe(tool: string, input: Record<string, unknown>): string {
   return `${tool} ${JSON.stringify(input ?? {})}`;
 }
 
+const WRITE_TOOLS = new Set(["write", "edit"]);
+
+// A write or edit to omp's session scratch (`local://`, where plan mode keeps its plan) or the
+// plan-approval device (`xd://propose`). Nothing leaves the machine and no project file changes, so
+// these are never checked — omp itself lets read-only agents write `local://`.
+export function isScratchWrite(tool: string, input: Record<string, unknown>): boolean {
+  if (!WRITE_TOOLS.has(tool)) {
+    return false;
+  }
+  const target = input.path ?? input.file_path;
+  if (typeof target !== "string") {
+    return false;
+  }
+  return target.startsWith("local://") || target === "xd://propose";
+}
+
 // The working directory of a call: the session's, or a bash call's own `cwd` resolved against it.
 function callCwd(tool: string, input: Record<string, unknown>, ctx: DeciderContext): string {
   const base = ctx.cwd ?? process.cwd();
@@ -402,6 +418,9 @@ async function decideTraced(config: Config, engine: Engine, event: ToolCallEvent
 
   const tool = event.toolName;
   if (config.whitelist.includes(tool)) {
+    return undefined;
+  }
+  if (isScratchWrite(tool, (event.input ?? {}) as Record<string, unknown>)) {
     return undefined;
   }
 

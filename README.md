@@ -96,7 +96,7 @@ handy for multi-line `question` strings. Every top-level key is optional — omi
 | `enabled` | `true` | Turn the gate off and let native approval decide alone. |
 | `debug` | `false` | One notification per checked call — outcome, command, each rule's risk (`b` = P(block), only for rules with `blockAbove`; `→verdict` when the llm was asked) and time, e.g. `allow · bash: uname -a · auto-mode .02 · data-exfiltration .05 b.01 · 360ms`. When the llm stage ran, the notification also lists the classifier's per-rule scores and bands, the llm model and time, and its verdict and reason for each rule. Step-by-step detail goes to `~/.omp/agent/omp-warden/debug.log` (also in headless runs and subagents). |
 | `includeContext` | `true` | Send the conversation so already-authorized calls aren't re-asked. |
-| `whitelist` | reads, search, todo, task, … | Tools never scored (native approval still applies). Omit for the built-in list. |
+| `whitelist` | reads, search, todo, task, … | Tools never scored (native approval still applies). Omit for the built-in list. Writes and edits to omp's `local://` scratch (where plan mode keeps its plan) and `xd://propose` are never scored either. |
 | `judgeRole` | `"judge"` | Stage-1 classifier model role. `null` disables the classifier stage. |
 | `llmRole` | `"smol"` | Stage-2 model role; falls back to `default`. `null` disables the llm stage. |
 | `onNoAnswer` | `"block"` | When the judge can't answer: `block` \| `ask` \| `allow`. |

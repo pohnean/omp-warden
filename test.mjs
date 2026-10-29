@@ -8,7 +8,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { createHandler, decide, describe as describeCall, matchesTool, matchingRules, renderState, sessionKey } from "./index.ts";
+import { createHandler, decide, describe as describeCall, matchesTool, matchingRules, renderState, sessionKey, isScratchWrite } from "./index.ts";
 import { escalationPrompt, parseEscalation, readRuleScore, resolveRole, resolveRoleModel } from "./decider.ts";
 import { DEFAULT_RULE, DEFAULTS, loadConfig, parseYaml, validateConfig } from "./config.ts";
 
@@ -494,4 +494,16 @@ test("debug: the time shown excludes waiting for the user", async () => {
   await decide(cfg({ debug: true }), engine, bash("git push"), ctx);
   const ms = Number(notes[0].match(/ (\d+)ms$/)[1]);
   assert.ok(ms < 100, `took ${ms}ms`);
+});
+
+test("writes to omp's local:// scratch (plan files) and xd://propose are never checked", async () => {
+  const { engine, calls } = makeEngine({ scores: auto(0.99) });
+  const ctx = { hasUI: true, ui: { select: async () => "Block" } };
+  assert.equal(await decide(cfg(), engine, { toolName: "write", input: { path: "local://deploy-plan.md", content: "x" } }, ctx), undefined);
+  assert.equal(await decide(cfg(), engine, { toolName: "edit", input: { path: "local://PLAN.md" } }, ctx), undefined);
+  assert.equal(await decide(cfg(), engine, { toolName: "write", input: { path: "xd://propose", content: "deploy" } }, ctx), undefined);
+  assert.equal(calls.classify, 0);
+  assert.ok(await decide(cfg(), engine, { toolName: "write", input: { path: "src/plan.md", content: "x" } }, ctx));
+  assert.ok(await decide(cfg(), engine, { toolName: "write", input: { path: "xd://other", content: "x" } }, ctx));
+  assert.equal(isScratchWrite("bash", { path: "local://x" }), false);
 });
