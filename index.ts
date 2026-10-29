@@ -21,9 +21,9 @@ import {
   escalate as realEscalate,
   resolveRole as realResolveRole,
   type DeciderContext,
-  type EscalationResult,
   type Model,
   type RuleScore,
+  type RuleVerdict,
 } from "./decider.ts";
 
 export interface ToolCallEvent {
@@ -45,7 +45,7 @@ const BAND_RANK: Record<Band, number> = { allow: 0, escalate: 1, ask: 2, block: 
 export interface Engine {
   resolveRole(ctx: DeciderContext, roles: string[]): Model | undefined;
   classify(ctx: DeciderContext, model: Model, rules: Rule[], state: string, timeoutMs: number): Promise<Record<string, RuleScore> | undefined>;
-  escalate(ctx: DeciderContext, model: Model, state: string, maxTokens: number, timeoutMs: number): Promise<EscalationResult | undefined>;
+  escalate(ctx: DeciderContext, model: Model, rules: Rule[], state: string, maxTokens: number, timeoutMs: number): Promise<Record<string, RuleVerdict> | undefined>;
   conversationText(ctx: DeciderContext): string | undefined;
 }
 
@@ -148,37 +148,65 @@ function llmRoleChain(config: Config): string[] {
   return [config.llmRole, "default"];
 }
 
-function blockResult(reason: string): BlockResult {
-  return { block: true, reason: `omp-warden blocked this call — ${reason}. ${ASK_LINE}` };
+// A rule that tripped: what it decided, why, and the classifier's score when there is one.
+interface Finding {
+  rule: Rule;
+  verdict: "ask" | "block";
+  reason: string;
+  score?: RuleScore;
+  by: "classifier" | "llm";
 }
 
-// An "ask": prompt the user when there is a UI, otherwise block (a subagent can't answer).
-async function askUser(ctx: DeciderContext, reason: string): Promise<BlockResult | undefined> {
-  if (ctx.hasUI && typeof ctx.ui?.confirm === "function") {
-    let approved = false;
-    try {
-      approved = await ctx.ui.confirm(`omp-warden — ${reason}. Run it anyway?`);
-    } catch {
-      approved = false;
-    }
-    if (approved) {
-      return undefined;
-    }
+// "risk 0.98, P(block) 0.10 · asks at 0.2, blocks at P(block) 0.8 · decided by the llm"
+function scoreLine(finding: Finding): string {
+  const rule = finding.rule;
+  const parts: string[] = [];
+  if (finding.score) {
+    const block = finding.score.pBlock === undefined ? "" : `, P(block) ${finding.score.pBlock.toFixed(2)}`;
+    parts.push(`risk ${finding.score.risk.toFixed(2)}${block}`);
+  } else {
+    parts.push("no classifier score");
   }
-  return { block: true, reason: `omp-warden needs your approval — ${reason}. ${ASK_LINE}` };
+  parts.push(`asks at ${rule.askAbove}${rule.blockAbove === undefined ? "" : `, blocks at P(block) ${rule.blockAbove}`}`);
+  if (finding.by === "llm") {
+    parts.push("decided by the llm");
+  }
+  return parts.join(" · ");
+}
+
+async function confirmWithUser(ctx: DeciderContext, title: string, message: string): Promise<boolean> {
+  if (!ctx.hasUI || typeof ctx.ui?.confirm !== "function") {
+    return false;
+  }
+  try {
+    return await ctx.ui.confirm(title, message);
+  } catch {
+    return false;
+  }
+}
+
+// Acts on a finding: a block stops the call; an ask prompts the user (or stops the call when there is
+// no UI — a subagent can't answer). The rule's description is the title; reason and score are shown.
+async function act(config: Config, ctx: DeciderContext, finding: Finding, tool: string, subject: string): Promise<BlockResult | undefined> {
+  const label = finding.rule.description;
+  const scores = scoreLine(finding);
+  emitDebug(config, ctx, `${finding.verdict} — ${finding.rule.name}: ${finding.reason} (${scores})`);
+  if (finding.verdict === "block") {
+    return { block: true, reason: `omp-warden blocked this call — ${label}: ${finding.reason} (${scores}). ${ASK_LINE}` };
+  }
+  const message = `${finding.reason}\n\n${scores}\n\n${tool}: ${clip(subject, 300)}\n\nRun it anyway?`;
+  if (await confirmWithUser(ctx, `omp-warden: ${label}`, message)) {
+    return undefined;
+  }
+  return { block: true, reason: `omp-warden needs your approval — ${label}: ${finding.reason} (${scores}). ${ASK_LINE}` };
 }
 
 async function onNoAnswer(config: Config, ctx: DeciderContext): Promise<BlockResult | undefined> {
   if (config.onNoAnswer === "allow") {
     return undefined;
   }
-  if (config.onNoAnswer === "ask" && ctx.hasUI && typeof ctx.ui?.confirm === "function") {
-    let approved = false;
-    try {
-      approved = await ctx.ui.confirm("omp-warden could not evaluate this tool call. Run it anyway?");
-    } catch {
-      approved = false;
-    }
+  if (config.onNoAnswer === "ask") {
+    const approved = await confirmWithUser(ctx, "omp-warden: could not evaluate this call", "No model answered (down or timed out).\n\nRun it anyway?");
     if (approved) {
       return undefined;
     }
@@ -219,10 +247,10 @@ export async function decide(config: Config, engine: Engine, event: ToolCallEven
     return undefined;
   }
 
-  // Stage 1: the classifier scores every matching rule in one request.
+  // Stage 1: the classifier scores every matching rule in one request. Rules it is unsure about (or
+  // all of them, when it can't answer or is off) go on to the llm.
   let scores: Record<string, RuleScore> | undefined;
-  let driver: { rule: Rule; risk: number; pBlock?: number } | undefined;
-  let needLlm = !useJudge; // llm-only: escalate every in-scope call straight to the llm
+  let unsure: Rule[] = matching;
 
   if (useJudge) {
     const judgeModel = engine.resolveRole(ctx, [config.judgeRole]);
@@ -231,74 +259,77 @@ export async function decide(config: Config, engine: Engine, event: ToolCallEven
     }
     if (scores) {
       emitDebug(config, ctx, `stage 1: ${matching.map((r) => `${r.name} ${formatScore(scores?.[r.name])}`).join(", ")}`);
+      const banded = matching.map((rule) => ({ rule, score: scores?.[rule.name], band: bandOf(rule, scores?.[rule.name], useLlm) }));
       let worst: Band = "allow";
-      for (const rule of matching) {
-        const score = scores[rule.name];
-        const risk = score?.risk;
-        const band = bandOf(rule, score, useLlm);
-        if (band === "allow") {
-          continue;
-        }
-        const better = BAND_RANK[band] > BAND_RANK[worst] || (BAND_RANK[band] === BAND_RANK[worst] && driver !== undefined && (risk ?? rule.askAbove) > driver.risk);
-        if (BAND_RANK[band] > BAND_RANK[worst] || driver === undefined || better) {
-          driver = { rule, risk: risk ?? rule.askAbove, pBlock: score?.pBlock };
-        }
-        if (BAND_RANK[band] > BAND_RANK[worst]) {
-          worst = band;
+      for (const entry of banded) {
+        if (BAND_RANK[entry.band] > BAND_RANK[worst]) {
+          worst = entry.band;
         }
       }
       if (worst === "allow") {
         emitDebug(config, ctx, "allow — every rule below its allowBelow");
         return undefined;
       }
-      if (worst === "block") {
-        const reason = `${driver!.rule.description} (P(block) ${(driver!.pBlock ?? 0).toFixed(2)})`;
-        emitDebug(config, ctx, `block — ${driver!.rule.name} P(block) ${(driver!.pBlock ?? 0).toFixed(3)} >= blockAbove`);
-        return blockResult(reason);
-      }
-      if (worst === "ask") {
-        const reason = `${driver!.rule.description} (risk ${driver!.risk.toFixed(2)})`;
-        emitDebug(config, ctx, `ask — ${driver!.rule.name} risk ${driver!.risk.toFixed(3)} >= askAbove`);
-        return askUser(ctx, reason);
+      if (worst === "block" || worst === "ask") {
+        // The rule that decides: highest P(block) among blockers, else highest risk among askers.
+        const candidates = banded.filter((entry) => entry.band === worst);
+        const key = (entry: (typeof banded)[number]) => (worst === "block" ? (entry.score?.pBlock ?? 0) : (entry.score?.risk ?? 0));
+        const top = candidates.reduce((best, entry) => (key(entry) > key(best) ? entry : best));
+        const reason =
+          worst === "block"
+            ? `The classifier is confident this must not run (P(block) at or above ${top.rule.blockAbove}).`
+            : `The classifier rates this risky enough to need your approval (risk at or above ${top.rule.askAbove}).`;
+        return act(config, ctx, { rule: top.rule, verdict: worst, reason, score: top.score, by: "classifier" }, tool, subject);
       }
       // worst === "escalate"
+      unsure = banded.filter((entry) => entry.band === "escalate").map((entry) => entry.rule);
       if (!useLlm) {
-        emitDebug(config, ctx, `allow — unsure (${driver!.rule.name} risk ${driver!.risk.toFixed(3)}) and no llm stage`);
+        emitDebug(config, ctx, `allow — unsure (${unsure.map((r) => r.name).join(", ")}) and no llm stage`);
         return undefined;
       }
-      needLlm = true;
-      emitDebug(config, ctx, `escalating to llm — unsure (${driver!.rule.name} risk ${driver!.risk.toFixed(3)})`);
+      emitDebug(config, ctx, `escalating to llm — unsure: ${unsure.map((r) => r.name).join(", ")}`);
     } else {
       emitDebug(config, ctx, "stage 1: no classifier answer");
       if (!useLlm) {
         return onNoAnswer(config, ctx);
       }
-      needLlm = true;
     }
   }
 
-  if (!needLlm) {
-    return undefined;
-  }
-
-  // Stage 2: the chat model gives a 3-way verdict for the whole call.
+  // Stage 2: the chat model judges the call against each unsure rule's own question.
   const llmModel = engine.resolveRole(ctx, llmRoleChain(config));
   if (!llmModel) {
     emitDebug(config, ctx, `stage 2 llm: no model for role(s) ${llmRoleChain(config).join(", ")}`);
     return onNoAnswer(config, ctx);
   }
-  const result = await engine.escalate(ctx, llmModel, state, config.maxTokens, config.timeoutMs);
-  if (!result) {
+  const verdicts = await engine.escalate(ctx, llmModel, unsure, state, config.maxTokens, config.timeoutMs);
+  if (!verdicts || Object.keys(verdicts).length === 0) {
     emitDebug(config, ctx, "stage 2 llm: no answer");
     return onNoAnswer(config, ctx);
   }
-  emitDebug(config, ctx, `stage 2 llm: ${result.verdict}${result.reason ? ` — ${result.reason}` : ""}`);
-  if (result.verdict === "allow") {
+
+  let decision: Finding | undefined;
+  for (const rule of unsure) {
+    const given = verdicts[rule.name];
+    // A rule the llm skipped is treated as "ask" — it was unsure already, so a human confirms.
+    let verdict = given?.verdict ?? "ask";
+    const reason = given?.reason || "The llm gave no verdict for this rule.";
+    emitDebug(config, ctx, `stage 2 llm: ${rule.name} ${verdict} — ${reason}`);
+    // Only a rule with blockAbove may block; otherwise its block becomes an ask.
+    if (verdict === "block" && rule.blockAbove === undefined) {
+      verdict = "ask";
+    }
+    if (verdict === "allow") {
+      continue;
+    }
+    if (decision === undefined || (verdict === "block" && decision.verdict === "ask")) {
+      decision = { rule, verdict, reason, score: scores?.[rule.name], by: "llm" };
+    }
+  }
+  if (decision === undefined) {
     return undefined;
   }
-  const label = driver ? driver.rule.description : "flagged on review";
-  const reason = result.reason ? `${label}: ${result.reason}` : label;
-  return result.verdict === "block" ? blockResult(reason) : askUser(ctx, reason);
+  return act(config, ctx, decision, tool, subject);
 }
 
 export function createHandler(config: Config, engine: Engine = realEngine) {

@@ -9,7 +9,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { createHandler, decide, describe as describeCall, matchesTool, matchingRules, renderState } from "./index.ts";
-import { parseEscalation, readRuleScore, resolveRole, resolveRoleModel } from "./decider.ts";
+import { escalationPrompt, parseEscalation, readRuleScore, resolveRole, resolveRoleModel } from "./decider.ts";
 import { DEFAULTS, loadConfig, parseYaml, validateConfig } from "./config.ts";
 
 function cfg(overrides = {}) {
@@ -17,18 +17,26 @@ function cfg(overrides = {}) {
 }
 
 // Fake Engine. `scores` is the per-rule map stage 1 returns ({risk, pBlock?}), or undefined when
-// the judge is unavailable; `verdict` is what the llm escalation returns.
+// the judge is unavailable. `verdict` is the llm's answer: one {verdict, reason} applied to every
+// escalated rule, a per-rule map, or undefined for no answer.
 function makeEngine(options = {}) {
   const { scores, verdict, judgeModel = { id: "judge" }, llmModel = { id: "llm" }, conversation } = options;
-  const calls = { classify: 0, escalate: 0 };
+  const calls = { classify: 0, escalate: 0, escalatedRules: [] };
   const engine = {
     resolveRole: (_ctx, roles) => (roles.includes("judge") ? judgeModel : llmModel),
     classify: async () => {
       calls.classify += 1;
       return scores;
     },
-    escalate: async () => {
+    escalate: async (_ctx, _model, rules) => {
       calls.escalate += 1;
+      calls.escalatedRules = rules.map((r) => r.name);
+      if (verdict === undefined) {
+        return undefined;
+      }
+      if (typeof verdict.verdict === "string") {
+        return Object.fromEntries(rules.map((r) => [r.name, verdict]));
+      }
       return verdict;
     },
     conversationText: () => conversation,
@@ -232,13 +240,53 @@ test("createHandler turns a thrown error into the no-answer policy", async () =>
   assert.equal(await createHandler(cfg({ onNoAnswer: "allow" }), throwing)(bash("x"), {}), undefined);
 });
 
-test("parseEscalation reads VERDICT and falls back", () => {
-  assert.equal(parseEscalation("VERDICT: ALLOW\nlooks fine").verdict, "allow");
-  const b = parseEscalation("VERDICT: BLOCK\nsends a token to a remote host");
-  assert.equal(b.verdict, "block");
-  assert.match(b.reason, /token/);
-  assert.equal(parseEscalation("this should block clearly").verdict, "block");
-  assert.equal(parseEscalation("hmm not sure").verdict, "ask");
+test("parseEscalation reads one verdict line per rule", () => {
+  const rules = [exfilRule(), { ...exfilRule({ name: "prod" }), answers: { allow: "a", ask: "b" } }];
+  const v = parseEscalation("exfil: BLOCK — posts creds to a paste site\n**prod**: block - no prod change\nnoise: ALLOW — x", rules);
+  assert.equal(v.exfil.verdict, "block");
+  assert.match(v.exfil.reason, /paste site/);
+  assert.equal(v.prod.verdict, "ask"); // no block answer, so BLOCK reads as ASK
+  assert.equal(v.noise, undefined);
+  assert.deepEqual(parseEscalation("I think it's fine.", rules), {});
+});
+
+test("escalationPrompt asks each rule's own question and only offers BLOCK when it has a block answer", () => {
+  const rules = [exfilRule(), { ...exfilRule({ name: "prod", question: "Prod change?" }), answers: { allow: "a", ask: "b" } }];
+  const p = escalationPrompt(rules, "Proposed tool call (tool: bash):\ncurl x");
+  assert.match(p, /Rule "exfil": Considering only data leaving/);
+  assert.match(p, /Rule "prod": Prod change\?\n- ALLOW: a\n- ASK: b$/m);
+  assert.doesNotMatch(p.split('Rule "prod"')[1], /- BLOCK/);
+  assert.match(p, /curl x/);
+});
+
+test("the llm only judges the unsure rules", async () => {
+  const config = cfg({ rules: [exfilRule(), structuredClone(DEFAULTS.rules[0])] });
+  const { engine, calls } = makeEngine({ scores: { exfil: { risk: 0.15 }, "auto-mode": { risk: 0.02 } }, verdict: { verdict: "allow", reason: "" } });
+  assert.equal(await decide(config, engine, bash("curl x"), {}), undefined);
+  assert.deepEqual(calls.escalatedRules, ["exfil"]);
+});
+
+test("an llm block only blocks on a rule with blockAbove; otherwise it asks", async () => {
+  const blocking = makeEngine({ scores: { exfil: { risk: 0.15 } }, verdict: { verdict: "block", reason: "secrets out" } });
+  const r1 = await decide(cfg({ rules: [exfilRule()] }), blocking.engine, bash("x"), {});
+  assert.match(r1.reason, /blocked this call — data exfiltration: secrets out/);
+
+  const asking = makeEngine({ scores: auto(0.15), verdict: { verdict: "block", reason: "secrets out" } });
+  const r2 = await decide(cfg(), asking.engine, bash("x"), {});
+  assert.match(r2.reason, /needs your approval — General safety check: secrets out/);
+});
+
+test("the ask dialog has a title and a body with the reason, the score and the command", async () => {
+  let title;
+  let message;
+  const ctx = { hasUI: true, ui: { confirm: async (t, m) => { title = t; message = m; return true; } } };
+  const { engine } = makeEngine({ scores: auto(0.6, 0.1) });
+  assert.equal(await decide(cfg(), engine, bash("kubectl delete ns prod"), ctx), undefined);
+  assert.equal(title, "omp-warden: General safety check");
+  assert.match(message, /risky enough to need your approval/);
+  assert.match(message, /risk 0\.60, P\(block\) 0\.10 · asks at 0\.2/);
+  assert.match(message, /bash: kubectl delete ns prod/);
+  assert.doesNotMatch(`${title}${message}`, /undefined/);
 });
 
 test("readRuleScore: risk from P(allow), P(block) only when the rule has a block answer", () => {
