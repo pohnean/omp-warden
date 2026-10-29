@@ -13,9 +13,14 @@
 // The hook only ever blocks or asks (never force-allows), so it composes with omp's approval mode.
 // Run it under `approvalMode: yolo` for a permissive default.
 
+import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import path from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import { loadConfig, type Config, type Rule } from "./config.ts";
+import { AGENT_DIR, CONFIG_DIR, loadConfig, parseYaml, type Config, type Rule } from "./config.ts";
 import {
+  type RoleSettings,
+  describeRole,
+  type ClassifyResult,
   classify as realClassify,
   conversationText as realConversationText,
   escalate as realEscalate,
@@ -44,7 +49,7 @@ const BAND_RANK: Record<Band, number> = { allow: 0, escalate: 1, ask: 2, block: 
 // for pi-ai or a live model.
 export interface Engine {
   resolveRole(ctx: DeciderContext, roles: string[]): Model | undefined;
-  classify(ctx: DeciderContext, model: Model, rules: Rule[], state: string, timeoutMs: number): Promise<Record<string, RuleScore> | undefined>;
+  classify(ctx: DeciderContext, model: Model, rules: Rule[], state: string, timeoutMs: number): Promise<ClassifyResult>;
   escalate(ctx: DeciderContext, model: Model, rules: Rule[], state: string, maxTokens: number, timeoutMs: number): Promise<Record<string, RuleVerdict> | undefined>;
   conversationText(ctx: DeciderContext): string | undefined;
 }
@@ -124,18 +129,34 @@ function formatScore(score: RuleScore | undefined): string {
   return `risk=${score.risk.toFixed(3)}${block}`;
 }
 
+export const DEBUG_LOG = path.join(CONFIG_DIR, "debug.log");
+
+// Appends a debug line to DEBUG_LOG, the one place debug output can always be found (omp's
+// notifications are invisible in headless runs and subagents). Never throws.
+function appendDebugLog(line: string): void {
+  try {
+    mkdirSync(CONFIG_DIR, { recursive: true });
+    appendFileSync(DEBUG_LOG, `${new Date().toISOString()} ${line}\n`);
+  } catch {
+    // Logging must never break a decision.
+  }
+}
+
+// When `debug` is on: every line goes to DEBUG_LOG, and also to omp's notifications when the host
+// shows them (else to stderr).
 function emitDebug(config: Config, ctx: DeciderContext, message: string): void {
   if (!config.debug) {
     return;
   }
   const line = `[omp-warden] ${message}`;
+  appendDebugLog(line);
   try {
     if (typeof ctx.ui?.notify === "function") {
       ctx.ui.notify(line, "info");
       return;
     }
   } catch {
-    // Fall through to the log.
+    // Fall through to stderr.
   }
   console.error(line);
 }
@@ -254,8 +275,12 @@ export async function decide(config: Config, engine: Engine, event: ToolCallEven
 
   if (useJudge) {
     const judgeModel = engine.resolveRole(ctx, [config.judgeRole]);
+    emitDebug(config, ctx, `stage 1 judge: ${describeRole(ctx, config.judgeRole, judgeModel)}`);
+    let classifyError = "no model for the judge role";
     if (judgeModel) {
-      scores = await engine.classify(ctx, judgeModel, matching, state, config.timeoutMs);
+      const result = await engine.classify(ctx, judgeModel, matching, state, config.timeoutMs);
+      scores = result.scores;
+      classifyError = result.error ?? "no scores";
     }
     if (scores) {
       emitDebug(config, ctx, `stage 1: ${matching.map((r) => `${r.name} ${formatScore(scores?.[r.name])}`).join(", ")}`);
@@ -289,7 +314,7 @@ export async function decide(config: Config, engine: Engine, event: ToolCallEven
       }
       emitDebug(config, ctx, `escalating to llm — unsure: ${unsure.map((r) => r.name).join(", ")}`);
     } else {
-      emitDebug(config, ctx, "stage 1: no classifier answer");
+      emitDebug(config, ctx, `stage 1: no classifier answer — ${classifyError}`);
       if (!useLlm) {
         return onNoAnswer(config, ctx);
       }
@@ -346,11 +371,58 @@ export function createHandler(config: Config, engine: Engine = realEngine) {
   };
 }
 
+const hasGetModelRole = (settings: unknown): settings is RoleSettings =>
+  typeof (settings as RoleSettings | undefined)?.getModelRole === "function";
+
+// Last resort: `modelRoles` read straight from omp's global config.yml, re-read on every call so a
+// change made in /settings is picked up. Project-level role overrides are not seen this way.
+const CONFIG_YML = path.join(AGENT_DIR, "config.yml");
+const fileRoleSettings: RoleSettings = {
+  source: CONFIG_YML,
+  getModelRole(role: string): string | undefined {
+    try {
+      const parsed = parseYaml(readFileSync(CONFIG_YML, "utf8")) as { modelRoles?: Record<string, unknown> } | null;
+      const spec = parsed?.modelRoles?.[role];
+      return typeof spec === "string" && spec.length > 0 ? spec : undefined;
+    } catch {
+      return undefined;
+    }
+  },
+};
+
+// omp doesn't hand the tool_call hook its role settings (ctx.settings has no getModelRole), so find
+// them elsewhere: omp's settings object on the plugin API, else config.yml.
+function hostRoleSettings(pi: ExtensionAPI): RoleSettings {
+  const api = pi as unknown as { pi?: { settings?: unknown }; settings?: unknown };
+  for (const [settings, source] of [
+    [api.pi?.settings, "omp settings (pi.pi.settings)"],
+    [api.settings, "omp settings (pi.settings)"],
+  ] as const) {
+    if (hasGetModelRole(settings)) {
+      return {
+        source,
+        getModelRole: (role: string) => (settings as RoleSettings).getModelRole?.(role),
+      };
+    }
+  }
+  return fileRoleSettings;
+}
+
+// The hook's ctx, with role settings filled in when omp left them out. Object.create keeps every
+// other property and method of the original ctx.
+function withRoleSettings(ctx: DeciderContext, fallback: RoleSettings): DeciderContext {
+  if (hasGetModelRole(ctx.settings)) {
+    return ctx;
+  }
+  return Object.create(ctx, { settings: { value: fallback } }) as DeciderContext;
+}
+
 export default function (pi: ExtensionAPI): void {
   const loaded = loadConfig();
   if (loaded.error) {
     console.error(`[omp-warden] config ignored, using defaults: ${loaded.error}`);
   }
   const handler = createHandler(loaded.config);
-  pi.on("tool_call", (event, ctx) => handler(event as ToolCallEvent, ctx as unknown as DeciderContext));
+  const roles = hostRoleSettings(pi);
+  pi.on("tool_call", (event, ctx) => handler(event as ToolCallEvent, withRoleSettings(ctx as unknown as DeciderContext, roles)));
 }

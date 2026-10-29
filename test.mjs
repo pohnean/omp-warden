@@ -26,7 +26,7 @@ function makeEngine(options = {}) {
     resolveRole: (_ctx, roles) => (roles.includes("judge") ? judgeModel : llmModel),
     classify: async () => {
       calls.classify += 1;
-      return scores;
+      return scores === undefined ? { error: "fake judge unavailable" } : { scores };
     },
     escalate: async (_ctx, _model, rules) => {
       calls.escalate += 1;

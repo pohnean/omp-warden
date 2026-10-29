@@ -27,8 +27,10 @@ interface ModelRegistry {
   getApiKey(model: unknown): Promise<string | undefined>;
 }
 
-interface RoleSettings {
+export interface RoleSettings {
   getModelRole?(role: string): string | undefined;
+  // Where these role settings came from, for logs.
+  source?: string;
 }
 
 // Only the parts of omp's ExtensionContext the decider touches. Typed loosely so the plugin is
@@ -161,36 +163,44 @@ function buildQuestion(rule: Rule): Record<string, unknown> {
   return { type: "choice", instructions: rule.question, criteria: { ...rule.answers } };
 }
 
-// Stage 1: score every rule in ONE request, keyed by rule name. Returns a partial score map, or
-// undefined when the judge is unavailable (not a native judge, no credentials, timeout) so the
-// caller can apply its no-answer policy.
+// What stage 1 returns: scores keyed by rule name, or why the judge couldn't answer.
+export interface ClassifyResult {
+  scores?: Record<string, RuleScore>;
+  error?: string;
+}
+
+const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+// Stage 1: score every rule in ONE request, keyed by rule name. When the judge is unavailable (not
+// a native judge, no credentials, timeout) it says why, so the caller can log it and apply its
+// no-answer policy.
 export async function classify(
   ctx: DeciderContext,
   model: Model,
   rules: Rule[],
   state: string,
   timeoutMs: number,
-): Promise<Record<string, RuleScore> | undefined> {
+): Promise<ClassifyResult> {
   const registry = ctx.modelRegistry;
   if (!registry) {
-    return undefined;
+    return { error: "omp gave the hook no model registry" };
   }
 
   let ai: PiAi;
   try {
     ai = await loadPiAi();
-  } catch {
-    return undefined;
+  } catch (error) {
+    return { error: `cannot load @oh-my-pi/pi-ai: ${errorText(error)}` };
   }
   if (typeof ai.hasNativeJudge === "function" && !ai.hasNativeJudge(model)) {
-    return undefined;
+    return { error: `${modelId(model)} is not a native judge (its api must be a System One api, e.g. "typesafe")` };
   }
 
   let apiKey: string;
   try {
     apiKey = (await registry.getApiKey(model)) ?? "";
-  } catch {
-    return undefined;
+  } catch (error) {
+    return { error: `getting credentials for ${modelId(model)} failed: ${errorText(error)}` };
   }
 
   const questions: Record<string, unknown> = {};
@@ -209,10 +219,39 @@ export async function classify(
         scores[rule.name] = score;
       }
     }
-    return scores;
-  } catch {
-    return undefined;
+    if (Object.keys(scores).length === 0) {
+      return { error: `${modelId(model)} answered without usable probabilities: ${JSON.stringify(answers).slice(0, 200)}` };
+    }
+    return { scores };
+  } catch (error) {
+    return { error: `judge call to ${modelId(model)} failed: ${errorText(error)}` };
   }
+}
+
+// "provider/id" for logs.
+export function modelId(model: Model | undefined): string {
+  if (!model) {
+    return "no model";
+  }
+  const provider = typeof model.provider === "string" ? model.provider : "";
+  const id = typeof model.id === "string" ? model.id : "?";
+  return provider ? `${provider}/${id}` : id;
+}
+
+// How a role resolved, for logs: the spec omp returned (if the hook can see role settings) and the
+// model it became.
+export function describeRole(ctx: DeciderContext, role: string, model: Model | undefined): string {
+  let spec: string | undefined;
+  let visible = false;
+  try {
+    visible = typeof ctx.settings?.getModelRole === "function";
+    spec = ctx.settings?.getModelRole?.(role);
+  } catch (error) {
+    spec = `error: ${errorText(error)}`;
+  }
+  const from = ctx.settings?.source ? ` (from ${ctx.settings.source})` : "";
+  const source = !visible ? "role settings not visible to the hook" : spec ? `modelRoles.${role} = ${spec}${from}` : `modelRoles.${role} unset${from}`;
+  return `${source} -> ${modelId(model)}`;
 }
 
 // The stage-2 prompt: the call, then each escalated rule's own question and answers, asking for one
