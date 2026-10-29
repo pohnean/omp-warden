@@ -121,6 +121,27 @@ function bandOf(rule: Rule, score: RuleScore | undefined, useLlm: boolean): Band
   return "allow";
 }
 
+// One call's debug summary, shown as a single notification: the call, each rule's score (and the
+// llm's verdict when it was asked), the outcome and the time taken.
+interface Trace {
+  started: number;
+  head: string;
+  parts: Map<string, string>;
+  outcome?: string;
+}
+
+// 0.048 -> ".05"
+const short = (n: number): string => n.toFixed(2).replace(/^0(?=\.)/, "");
+
+// ".95 b.90" — P(block) only for a rule that can block.
+function tracePart(rule: Rule, score: RuleScore | undefined): string {
+  if (score === undefined) {
+    return "?";
+  }
+  const block = rule.blockAbove !== undefined && score.pBlock !== undefined ? ` b${short(score.pBlock)}` : "";
+  return `${short(score.risk)}${block}`;
+}
+
 function formatScore(score: RuleScore | undefined): string {
   if (score === undefined) {
     return "?";
@@ -142,13 +163,22 @@ function appendDebugLog(line: string): void {
   }
 }
 
-// When `debug` is on: every line goes to DEBUG_LOG, and also to omp's notifications when the host
-// shows them (else to stderr).
+// When `debug` is on: a detail line, written to DEBUG_LOG only.
 function emitDebug(config: Config, ctx: DeciderContext, message: string): void {
   if (!config.debug) {
     return;
   }
-  const line = `[omp-warden] ${message}`;
+  appendDebugLog(`[omp-warden] ${message}`);
+}
+
+// When `debug` is on: the call's one-line summary, to DEBUG_LOG and as an omp notification (stderr
+// when the host has no notifier).
+function emitSummary(config: Config, ctx: DeciderContext, trace: Trace): void {
+  if (!config.debug || trace.head === "") {
+    return;
+  }
+  const scores = [...trace.parts].map(([name, part]) => `${name} ${part}`);
+  const line = ["[omp-warden]", trace.outcome ?? "allow", "·", [trace.head, ...scores, `${Date.now() - trace.started}ms`].join(" · ")].join(" ");
   appendDebugLog(line);
   try {
     if (typeof ctx.ui?.notify === "function") {
@@ -208,29 +238,40 @@ async function confirmWithUser(ctx: DeciderContext, title: string, message: stri
 
 // Acts on a finding: a block stops the call; an ask prompts the user (or stops the call when there is
 // no UI — a subagent can't answer). The rule's description is the title; reason and score are shown.
-async function act(config: Config, ctx: DeciderContext, finding: Finding, tool: string, subject: string): Promise<BlockResult | undefined> {
+async function act(config: Config, ctx: DeciderContext, finding: Finding, tool: string, subject: string, trace: Trace): Promise<BlockResult | undefined> {
   const label = finding.rule.description;
   const scores = scoreLine(finding);
   emitDebug(config, ctx, `${finding.verdict} — ${finding.rule.name}: ${finding.reason} (${scores})`);
   if (finding.verdict === "block") {
+    trace.outcome = `block ${finding.rule.name}`;
     return { block: true, reason: `omp-warden blocked this call — ${label}: ${finding.reason} (${scores}). ${ASK_LINE}` };
   }
-  const message = `${finding.reason}\n\n${scores}\n\n${tool}: ${clip(subject, 300)}\n\nRun it anyway?`;
-  if (await confirmWithUser(ctx, `omp-warden: ${label}`, message)) {
+  const message = `${finding.reason}\n\n${tool}: ${clip(subject, 300)}\n\nRun it anyway?`;
+  const approved = await confirmWithUser(ctx, `omp-warden: ${label}`, message);
+  trace.outcome = `ask ${finding.rule.name} → ${approved ? "approved" : ctx.hasUI ? "declined" : "blocked (no UI)"}`;
+  if (approved) {
     return undefined;
   }
   return { block: true, reason: `omp-warden needs your approval — ${label}: ${finding.reason} (${scores}). ${ASK_LINE}` };
 }
 
-async function onNoAnswer(config: Config, ctx: DeciderContext): Promise<BlockResult | undefined> {
+async function onNoAnswer(config: Config, ctx: DeciderContext, trace?: Trace): Promise<BlockResult | undefined> {
   if (config.onNoAnswer === "allow") {
+    if (trace) {
+      trace.outcome = "no answer → allow";
+    }
     return undefined;
   }
   if (config.onNoAnswer === "ask") {
     const approved = await confirmWithUser(ctx, "omp-warden: could not evaluate this call", "No model answered (down or timed out).\n\nRun it anyway?");
+    if (trace) {
+      trace.outcome = `no answer → ask → ${approved ? "approved" : "blocked"}`;
+    }
     if (approved) {
       return undefined;
     }
+  } else if (trace) {
+    trace.outcome = "no answer → block";
   }
   return {
     block: true,
@@ -241,6 +282,15 @@ async function onNoAnswer(config: Config, ctx: DeciderContext): Promise<BlockRes
 // The core decision for one tool call. Returns a block result, or undefined to let the call pass
 // on to omp's native approval.
 export async function decide(config: Config, engine: Engine, event: ToolCallEvent, ctx: DeciderContext): Promise<BlockResult | undefined> {
+  const trace: Trace = { started: Date.now(), head: "", parts: new Map() };
+  try {
+    return await decideTraced(config, engine, event, ctx, trace);
+  } finally {
+    emitSummary(config, ctx, trace);
+  }
+}
+
+async function decideTraced(config: Config, engine: Engine, event: ToolCallEvent, ctx: DeciderContext, trace: Trace): Promise<BlockResult | undefined> {
   if (!config.enabled) {
     return undefined;
   }
@@ -260,11 +310,13 @@ export async function decide(config: Config, engine: Engine, event: ToolCallEven
   const conversation = config.includeContext ? engine.conversationText(ctx) : undefined;
   const state = renderState(tool, subject, conversation);
   emitDebug(config, ctx, `checking ${tool} [${matching.map((r) => r.name).join(", ")}]: ${clip(subject)}`);
+  trace.head = `${tool}: ${clip(subject, 60)}`;
 
   const useJudge = config.judgeRole !== "";
   const useLlm = config.llmRole !== "";
   if (!useJudge && !useLlm) {
     emitDebug(config, ctx, "no decider configured — passing through to native approval");
+    trace.outcome = "no decider → native";
     return undefined;
   }
 
@@ -284,6 +336,9 @@ export async function decide(config: Config, engine: Engine, event: ToolCallEven
     }
     if (scores) {
       emitDebug(config, ctx, `stage 1: ${matching.map((r) => `${r.name} ${formatScore(scores?.[r.name])}`).join(", ")}`);
+      for (const rule of matching) {
+        trace.parts.set(rule.name, tracePart(rule, scores[rule.name]));
+      }
       const banded = matching.map((rule) => ({ rule, score: scores?.[rule.name], band: bandOf(rule, scores?.[rule.name], useLlm) }));
       let worst: Band = "allow";
       for (const entry of banded) {
@@ -304,19 +359,21 @@ export async function decide(config: Config, engine: Engine, event: ToolCallEven
           worst === "block"
             ? `The classifier is confident this must not run (P(block) at or above ${top.rule.blockAbove}).`
             : `The classifier rates this risky enough to need your approval (risk at or above ${top.rule.askAbove}).`;
-        return act(config, ctx, { rule: top.rule, verdict: worst, reason, score: top.score, by: "classifier" }, tool, subject);
+        return act(config, ctx, { rule: top.rule, verdict: worst, reason, score: top.score, by: "classifier" }, tool, subject, trace);
       }
       // worst === "escalate"
       unsure = banded.filter((entry) => entry.band === "escalate").map((entry) => entry.rule);
       if (!useLlm) {
         emitDebug(config, ctx, `allow — unsure (${unsure.map((r) => r.name).join(", ")}) and no llm stage`);
+        trace.outcome = "allow (unsure, no llm)";
         return undefined;
       }
       emitDebug(config, ctx, `escalating to llm — unsure: ${unsure.map((r) => r.name).join(", ")}`);
     } else {
       emitDebug(config, ctx, `stage 1: no classifier answer — ${classifyError}`);
+      trace.parts.set("judge", "no answer");
       if (!useLlm) {
-        return onNoAnswer(config, ctx);
+        return onNoAnswer(config, ctx, trace);
       }
     }
   }
@@ -325,12 +382,14 @@ export async function decide(config: Config, engine: Engine, event: ToolCallEven
   const llmModel = engine.resolveRole(ctx, llmRoleChain(config));
   if (!llmModel) {
     emitDebug(config, ctx, `stage 2 llm: no model for role(s) ${llmRoleChain(config).join(", ")}`);
-    return onNoAnswer(config, ctx);
+    trace.parts.set("llm", "no model");
+    return onNoAnswer(config, ctx, trace);
   }
   const verdicts = await engine.escalate(ctx, llmModel, unsure, state, config.maxTokens, config.timeoutMs);
   if (!verdicts || Object.keys(verdicts).length === 0) {
     emitDebug(config, ctx, "stage 2 llm: no answer");
-    return onNoAnswer(config, ctx);
+    trace.parts.set("llm", "no answer");
+    return onNoAnswer(config, ctx, trace);
   }
 
   let decision: Finding | undefined;
@@ -340,6 +399,8 @@ export async function decide(config: Config, engine: Engine, event: ToolCallEven
     let verdict = given?.verdict ?? "ask";
     const reason = given?.reason || "The llm gave no verdict for this rule.";
     emitDebug(config, ctx, `stage 2 llm: ${rule.name} ${verdict} — ${reason}`);
+    const scored = trace.parts.get(rule.name);
+    trace.parts.set(rule.name, scored === undefined ? `llm ${verdict}` : `${scored}→${verdict}`);
     // Only a rule with blockAbove may block; otherwise its block becomes an ask.
     if (verdict === "block" && rule.blockAbove === undefined) {
       verdict = "ask";
@@ -352,9 +413,10 @@ export async function decide(config: Config, engine: Engine, event: ToolCallEven
     }
   }
   if (decision === undefined) {
+    trace.outcome = "allow (llm)";
     return undefined;
   }
-  return act(config, ctx, decision, tool, subject);
+  return act(config, ctx, decision, tool, subject, trace);
 }
 
 export function createHandler(config: Config, engine: Engine = realEngine) {

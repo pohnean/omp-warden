@@ -10,7 +10,7 @@ import path from "node:path";
 
 import { createHandler, decide, describe as describeCall, matchesTool, matchingRules, renderState } from "./index.ts";
 import { escalationPrompt, parseEscalation, readRuleScore, resolveRole, resolveRoleModel } from "./decider.ts";
-import { DEFAULTS, loadConfig, parseYaml, validateConfig } from "./config.ts";
+import { DEFAULT_RULE, DEFAULTS, loadConfig, parseYaml, validateConfig } from "./config.ts";
 
 function cfg(overrides = {}) {
   return { ...structuredClone(DEFAULTS), ...overrides };
@@ -276,7 +276,7 @@ test("an llm block only blocks on a rule with blockAbove; otherwise it asks", as
   assert.match(r2.reason, /needs your approval — General safety check: secrets out/);
 });
 
-test("the ask dialog has a title and a body with the reason, the score and the command", async () => {
+test("the ask dialog has a title and a body with the reason and the command, no scores", async () => {
   let title;
   let message;
   const ctx = { hasUI: true, ui: { confirm: async (t, m) => { title = t; message = m; return true; } } };
@@ -284,7 +284,7 @@ test("the ask dialog has a title and a body with the reason, the score and the c
   assert.equal(await decide(cfg(), engine, bash("kubectl delete ns prod"), ctx), undefined);
   assert.equal(title, "omp-warden: General safety check");
   assert.match(message, /risky enough to need your approval/);
-  assert.match(message, /risk 0\.60, P\(block\) 0\.10 · asks at 0\.2/);
+  assert.doesNotMatch(message, /P\(block\)|asks at/);
   assert.match(message, /bash: kubectl delete ns prod/);
   assert.doesNotMatch(`${title}${message}`, /undefined/);
 });
@@ -369,4 +369,23 @@ test("loadConfig reads a YAML file and defaults the thresholds", () => {
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("debug: one notification per call with each rule's score, P(block) only where it can block", async () => {
+  const notes = [];
+  const ctx = { hasUI: true, ui: { notify: (m) => notes.push(m), confirm: async () => true } };
+  const rules = [exfilRule(), { ...DEFAULT_RULE }];
+  const { engine } = makeEngine({ scores: { exfil: { risk: 0.048, pBlock: 0.9 }, "auto-mode": { risk: 0.02, pBlock: 0.01 } } });
+  await decide(cfg({ debug: true, rules }), engine, bash("uname -a"), ctx);
+  assert.equal(notes.length, 1);
+  assert.match(notes[0], /^\[omp-warden\] block exfil · bash: uname -a · exfil \.05 b\.90 · auto-mode \.02 · \d+ms$/);
+});
+
+test("debug: an llm verdict is appended to the rule's score", async () => {
+  const notes = [];
+  const ctx = { hasUI: true, ui: { notify: (m) => notes.push(m) } };
+  const { engine } = makeEngine({ scores: auto(0.15), verdict: { verdict: "allow", reason: "" } });
+  await decide(cfg({ debug: true }), engine, bash("ls"), ctx);
+  assert.equal(notes.length, 1);
+  assert.match(notes[0], /allow \(llm\) · bash: ls · auto-mode \.15→allow · \d+ms$/);
 });

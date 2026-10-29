@@ -89,7 +89,7 @@ handy for multi-line `question` strings. Every top-level key is optional — omi
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `true` | Turn the gate off and let native approval decide alone. |
-| `debug` | `false` | Log each checked call: how the judge role resolved, each rule's scores, the llm's verdicts and the outcome. Lines are appended to `~/.omp/agent/omp-warden/debug.log` (always findable, also in headless runs and subagents) and shown as omp notifications where the UI has them. |
+| `debug` | `false` | One notification per checked call — outcome, command, each rule's risk (`b` = P(block), only for rules with `blockAbove`; `→verdict` when the llm was asked) and time, e.g. `allow · bash: uname -a · auto-mode .02 · data-exfiltration .05 b.01 · 360ms`. Step-by-step detail goes to `~/.omp/agent/omp-warden/debug.log` (also in headless runs and subagents). |
 | `includeContext` | `true` | Send the conversation so already-authorized calls aren't re-asked. |
 | `whitelist` | reads, search, todo, task, … | Tools never scored (native approval still applies). Omit for the built-in list. |
 | `judgeRole` | `"judge"` | Stage-1 classifier model role. `null` disables the classifier stage. |
