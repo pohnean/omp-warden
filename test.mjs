@@ -384,10 +384,23 @@ test("debug: one notification per call with each rule's score, P(block) only whe
 test("debug: an llm verdict is appended to the rule's score", async () => {
   const notes = [];
   const ctx = { hasUI: true, ui: { notify: (m) => notes.push(m) } };
-  const { engine } = makeEngine({ scores: auto(0.15), verdict: { verdict: "allow", reason: "" } });
+  const { engine } = makeEngine({ scores: auto(0.15), verdict: { verdict: "allow", reason: "lists files only" } });
   await decide(cfg({ debug: true }), engine, bash("ls"), ctx);
   assert.equal(notes.length, 1);
-  assert.match(notes[0], /allow \(llm\) · bash: ls · auto-mode \.15→allow · \d+ms$/);
+  const [summary, ...details] = notes[0].split("\n");
+  assert.match(summary, /allow \(llm\) · bash: ls · auto-mode \.15→allow · \d+ms$/);
+  const text = details.join("\n");
+  assert.match(text, /stage 1: auto-mode risk=0\.150 → unsure \(allowBelow 0\.1 ≤ risk < askAbove 0\.2\)/);
+  assert.match(text, /stage 2 llm: llm on auto-mode, \d+ms/);
+  assert.match(text, /stage 2 llm: auto-mode allow — /);
+});
+
+test("debug: without the llm stage the notification stays one line", async () => {
+  const notes = [];
+  const ctx = { hasUI: true, ui: { notify: (m) => notes.push(m) } };
+  const { engine } = makeEngine({ scores: auto(0.02) });
+  await decide(cfg({ debug: true }), engine, bash("ls"), ctx);
+  assert.equal(notes[0].includes("\n"), false);
 });
 
 // A UI whose select dialog answers from `picks` in order and records what it was shown.

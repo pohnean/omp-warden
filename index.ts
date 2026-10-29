@@ -21,6 +21,7 @@ import { AGENT_DIR, CONFIG_DIR, loadConfig, parseYaml, type Config, type Rule } 
 import {
   type RoleSettings,
   describeRole,
+  modelId,
   type ClassifyResult,
   classify as realClassify,
   conversationText as realConversationText,
@@ -169,6 +170,10 @@ interface Trace {
   head: string;
   parts: Map<string, string>;
   outcome?: string;
+  // The detail lines of this call (as written to DEBUG_LOG), shown under the summary when the llm
+  // stage ran.
+  details: string[];
+  escalated: boolean;
 }
 
 // 0.048 -> ".05"
@@ -181,6 +186,20 @@ function tracePart(rule: Rule, score: RuleScore | undefined): string {
   }
   const block = rule.blockAbove !== undefined && score.pBlock !== undefined ? ` b${short(score.pBlock)}` : "";
   return `${short(score.risk)}${block}`;
+}
+
+// Why a rule landed in its band, e.g. "unsure (allowBelow 0.1 ≤ risk < askAbove 0.3)".
+function bandText(rule: Rule, band: Band): string {
+  if (band === "block") {
+    return `block (P(block) ≥ blockAbove ${rule.blockAbove})`;
+  }
+  if (band === "ask") {
+    return `ask (risk ≥ askAbove ${rule.askAbove})`;
+  }
+  if (band === "escalate") {
+    return `unsure (allowBelow ${rule.allowBelow} ≤ risk < askAbove ${rule.askAbove})`;
+  }
+  return `allow (risk < allowBelow ${rule.allowBelow})`;
 }
 
 function formatScore(score: RuleScore | undefined): string {
@@ -204,16 +223,18 @@ function appendDebugLog(line: string): void {
   }
 }
 
-// When `debug` is on: a detail line, written to DEBUG_LOG only.
-function emitDebug(config: Config, ctx: DeciderContext, message: string): void {
+// When `debug` is on: a detail line, written to DEBUG_LOG and kept on the trace.
+function emitDebug(config: Config, trace: Trace, message: string): void {
   if (!config.debug) {
     return;
   }
   appendDebugLog(`[omp-warden] ${message}`);
+  trace.details.push(message);
 }
 
 // When `debug` is on: the call's one-line summary, to DEBUG_LOG and as an omp notification (stderr
-// when the host has no notifier).
+// when the host has no notifier). When the llm stage ran, the notification also lists every detail
+// line: the classifier's scores and the llm's verdict and reason per rule.
 function emitSummary(config: Config, ctx: DeciderContext, trace: Trace): void {
   if (!config.debug || trace.head === "") {
     return;
@@ -221,15 +242,16 @@ function emitSummary(config: Config, ctx: DeciderContext, trace: Trace): void {
   const scores = [...trace.parts].map(([name, part]) => `${name} ${part}`);
   const line = ["[omp-warden]", trace.outcome ?? "allow", "·", [trace.head, ...scores, `${Date.now() - trace.started}ms`].join(" · ")].join(" ");
   appendDebugLog(line);
+  const shown = trace.escalated ? [line, ...trace.details.map((detail) => `  ${detail}`)].join("\n") : line;
   try {
     if (typeof ctx.ui?.notify === "function") {
-      ctx.ui.notify(line, "info");
+      ctx.ui.notify(shown, "info");
       return;
     }
   } catch {
     // Fall through to stderr.
   }
-  console.error(line);
+  console.error(shown);
 }
 
 // The stage-2 role chain: the configured role, then "default" as a fallback.
@@ -312,7 +334,7 @@ async function askUser(ctx: DeciderContext, title: string, message: string): Pro
 async function act(config: Config, ctx: DeciderContext, finding: Finding, tool: string, subject: string, trace: Trace, onSession: () => void): Promise<BlockResult | undefined> {
   const label = finding.rule.description;
   const scores = scoreLine(finding);
-  emitDebug(config, ctx, `${finding.verdict} — ${finding.rule.name}: ${finding.reason} (${scores})`);
+  emitDebug(config, trace, `${finding.verdict} — ${finding.rule.name}: ${finding.reason} (${scores})`);
   if (finding.verdict === "block") {
     trace.outcome = `block ${finding.rule.name}`;
     return { block: true, reason: `omp-warden blocked this call — ${label}: ${finding.reason} (${scores}). ${ASK_LINE}` };
@@ -359,7 +381,7 @@ async function onNoAnswer(config: Config, ctx: DeciderContext, trace?: Trace): P
 // `session` holds the calls the user allowed for this session (see sessionKey); createHandler owns
 // one per omp session.
 export async function decide(config: Config, engine: Engine, event: ToolCallEvent, ctx: DeciderContext, session: Set<string> = new Set()): Promise<BlockResult | undefined> {
-  const trace: Trace = { started: Date.now(), head: "", parts: new Map() };
+  const trace: Trace = { started: Date.now(), head: "", parts: new Map(), details: [], escalated: false };
   try {
     return await decideTraced(config, engine, event, ctx, trace, session);
   } finally {
@@ -395,13 +417,13 @@ async function decideTraced(config: Config, engine: Engine, event: ToolCallEvent
   }
   const conversation = config.includeContext ? engine.conversationText(ctx) : undefined;
   const state = renderState(tool, subject, conversation);
-  emitDebug(config, ctx, `checking ${tool} [${matching.map((r) => r.name).join(", ")}]: ${clip(subject)}`);
+  emitDebug(config, trace, `checking ${tool} [${matching.map((r) => r.name).join(", ")}]: ${clip(subject)}`);
   trace.head = `${tool}: ${clip(subject, 60)}`;
 
   const useJudge = config.judgeRole !== "";
   const useLlm = config.llmRole !== "";
   if (!useJudge && !useLlm) {
-    emitDebug(config, ctx, "no decider configured — passing through to native approval");
+    emitDebug(config, trace, "no decider configured — passing through to native approval");
     trace.outcome = "no decider → native";
     return undefined;
   }
@@ -413,19 +435,21 @@ async function decideTraced(config: Config, engine: Engine, event: ToolCallEvent
 
   if (useJudge) {
     const judgeModel = engine.resolveRole(ctx, [config.judgeRole]);
-    emitDebug(config, ctx, `stage 1 judge: ${describeRole(ctx, config.judgeRole, judgeModel)}`);
+    emitDebug(config, trace, `stage 1 judge: ${describeRole(ctx, config.judgeRole, judgeModel)}`);
     let classifyError = "no model for the judge role";
+    const judgeStarted = Date.now();
     if (judgeModel) {
       const result = await engine.classify(ctx, judgeModel, matching, state, config.timeoutMs);
       scores = result.scores;
       classifyError = result.error ?? "no scores";
     }
     if (scores) {
-      emitDebug(config, ctx, `stage 1: ${matching.map((r) => `${r.name} ${formatScore(scores?.[r.name])}`).join(", ")}`);
-      for (const rule of matching) {
-        trace.parts.set(rule.name, tracePart(rule, scores[rule.name]));
-      }
+      emitDebug(config, trace, `stage 1 answered in ${Date.now() - judgeStarted}ms`);
       const banded = matching.map((rule) => ({ rule, score: scores?.[rule.name], band: bandOf(rule, scores?.[rule.name], useLlm) }));
+      for (const entry of banded) {
+        trace.parts.set(entry.rule.name, tracePart(entry.rule, entry.score));
+        emitDebug(config, trace, `stage 1: ${entry.rule.name} ${formatScore(entry.score)} → ${bandText(entry.rule, entry.band)}`);
+      }
       let worst: Band = "allow";
       for (const entry of banded) {
         if (BAND_RANK[entry.band] > BAND_RANK[worst]) {
@@ -433,7 +457,7 @@ async function decideTraced(config: Config, engine: Engine, event: ToolCallEvent
         }
       }
       if (worst === "allow") {
-        emitDebug(config, ctx, "allow — every rule below its allowBelow");
+        emitDebug(config, trace, "allow — every rule below its allowBelow");
         return undefined;
       }
       if (worst === "block" || worst === "ask") {
@@ -450,13 +474,13 @@ async function decideTraced(config: Config, engine: Engine, event: ToolCallEvent
       // worst === "escalate"
       unsure = banded.filter((entry) => entry.band === "escalate").map((entry) => entry.rule);
       if (!useLlm) {
-        emitDebug(config, ctx, `allow — unsure (${unsure.map((r) => r.name).join(", ")}) and no llm stage`);
+        emitDebug(config, trace, `allow — unsure (${unsure.map((r) => r.name).join(", ")}) and no llm stage`);
         trace.outcome = "allow (unsure, no llm)";
         return undefined;
       }
-      emitDebug(config, ctx, `escalating to llm — unsure: ${unsure.map((r) => r.name).join(", ")}`);
+      emitDebug(config, trace, `escalating to llm — unsure: ${unsure.map((r) => r.name).join(", ")}`);
     } else {
-      emitDebug(config, ctx, `stage 1: no classifier answer — ${classifyError}`);
+      emitDebug(config, trace, `stage 1: no classifier answer — ${classifyError}`);
       trace.parts.set("judge", "no answer");
       if (!useLlm) {
         return onNoAnswer(config, ctx, trace);
@@ -467,13 +491,16 @@ async function decideTraced(config: Config, engine: Engine, event: ToolCallEvent
   // Stage 2: the chat model judges the call against each unsure rule's own question.
   const llmModel = engine.resolveRole(ctx, llmRoleChain(config));
   if (!llmModel) {
-    emitDebug(config, ctx, `stage 2 llm: no model for role(s) ${llmRoleChain(config).join(", ")}`);
+    emitDebug(config, trace, `stage 2 llm: no model for role(s) ${llmRoleChain(config).join(", ")}`);
     trace.parts.set("llm", "no model");
     return onNoAnswer(config, ctx, trace);
   }
+  trace.escalated = true;
+  const llmStarted = Date.now();
   const verdicts = await engine.escalate(ctx, llmModel, unsure, state, config.maxTokens, config.timeoutMs);
+  emitDebug(config, trace, `stage 2 llm: ${modelId(llmModel)} on ${unsure.map((r) => r.name).join(", ")}, ${Date.now() - llmStarted}ms`);
   if (!verdicts || Object.keys(verdicts).length === 0) {
-    emitDebug(config, ctx, "stage 2 llm: no answer");
+    emitDebug(config, trace, "stage 2 llm: no answer");
     trace.parts.set("llm", "no answer");
     return onNoAnswer(config, ctx, trace);
   }
@@ -484,7 +511,7 @@ async function decideTraced(config: Config, engine: Engine, event: ToolCallEvent
     // A rule the llm skipped is treated as "ask" — it was unsure already, so a human confirms.
     let verdict = given?.verdict ?? "ask";
     const reason = given?.reason || "The llm gave no verdict for this rule.";
-    emitDebug(config, ctx, `stage 2 llm: ${rule.name} ${verdict} — ${reason}`);
+    emitDebug(config, trace, `stage 2 llm: ${rule.name} ${verdict} — ${reason}`);
     const scored = trace.parts.get(rule.name);
     trace.parts.set(rule.name, scored === undefined ? `llm ${verdict}` : `${scored}→${verdict}`);
     // Only a rule with blockAbove may block; otherwise its block becomes an ask.
