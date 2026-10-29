@@ -378,7 +378,7 @@ test("debug: classifier line — verdict, each rule's score (P(block) only where
   const { engine } = makeEngine({ scores: { exfil: { risk: 0.048, pBlock: 0.9 }, "auto-mode": { risk: 0.02, pBlock: 0.01 } } });
   await decide(cfg({ debug: true, rules }), engine, bash("uname -a"), ctx);
   assert.equal(notes.length, 1);
-  assert.match(notes[0], /^\[omp-warden\] classifier: BLOCK exfil: \.05 b\.90, auto-mode: \.02 \d+ms$/);
+  assert.match(notes[0], /^\[omp-warden\]       call: bash: uname -a\n\[omp-warden\] classifier: BLOCK exfil: \.05 b\.90, auto-mode: \.02 \d+ms$/);
 });
 
 test("debug: an llm line under the classifier line, with the llm's verdict and reason", async () => {
@@ -388,17 +388,19 @@ test("debug: an llm line under the classifier line, with the llm's verdict and r
   await decide(cfg({ debug: true }), engine, bash("ls"), ctx);
   assert.equal(notes.length, 1);
   const lines = notes[0].split("\n");
-  assert.equal(lines.length, 2);
-  assert.match(lines[0], /^\[omp-warden\] classifier: UNSURE auto-mode: \.15 \d+ms$/);
-  assert.match(lines[1], /^\[omp-warden\]        llm: ALLOW auto-mode: lists files only \d+ms$/);
+  assert.equal(lines.length, 3);
+  assert.equal(lines[0], "[omp-warden]       call: bash: ls");
+  assert.match(lines[1], /^\[omp-warden\] classifier: UNSURE auto-mode: \.15 \d+ms$/);
+  assert.match(lines[2], /^\[omp-warden\]        llm: ALLOW auto-mode: lists files only \d+ms$/);
 });
 
-test("debug: without the llm stage the notification stays one line", async () => {
+test("debug: without the llm stage there is no llm line", async () => {
   const notes = [];
   const ctx = { hasUI: true, ui: { notify: (m) => notes.push(m) } };
   const { engine } = makeEngine({ scores: auto(0.02) });
-  await decide(cfg({ debug: true }), engine, bash("ls"), ctx);
-  assert.equal(notes[0].includes("\n"), false);
+  await decide(cfg({ debug: true }), engine, bash("ls\n  -la"), ctx);
+  assert.equal(notes[0].split("\n").length, 2);
+  assert.match(notes[0], /call: bash: ls -la\n/);
 });
 
 // A UI whose select dialog answers from `picks` in order and records what it was shown.
@@ -482,7 +484,7 @@ test("session: the debug summary says allow (session); the handler keeps one set
   await handler(bash("git push"), ctx);
   assert.equal(calls.classify, 1);
   assert.match(notes[0], /classifier: ASK auto-mode: \.60/);
-  assert.equal(notes[1], "[omp-warden] session: ALLOW allowed earlier in this session");
+  assert.equal(notes[1], "[omp-warden]    call: bash: git push\n[omp-warden] session: ALLOW allowed earlier in this session");
 });
 
 test("debug: the time shown excludes waiting for the user", async () => {
