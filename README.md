@@ -42,9 +42,10 @@ thresholds, so you tune how eager the gate is per rule.
 
 ## Install
 
-1. Make this directory an omp plugin (install it through omp's plugin manager, or point omp's
-   `extensions` at it). The host provides the peer module `@oh-my-pi/pi-coding-agent`; `@oh-my-pi/pi-ai`
-   is imported lazily at decision time.
+1. Install it as an omp plugin — e.g. `omp plugin install /path/to/omp-warden` (a local path is
+   linked, so edits take effect). Run `npm install` in the plugin dir so its one dependency (`yaml`)
+   is present. The host provides the peer module `@oh-my-pi/pi-coding-agent`; `@oh-my-pi/pi-ai` is
+   imported lazily at decision time.
 2. Recommended omp setup in `~/.omp/agent/config.yml`:
 
    ```yaml
@@ -67,27 +68,34 @@ thresholds, so you tune how eager the gate is per rule.
 
 ## Configuration
 
-The source of truth is the plugin's own JSON config file (omp has no runtime API to hand a plugin
-its `/settings` values). Copy `config.example.jsonc`, strip the comments, and save as JSON at:
+The source of truth is the plugin's own config file (omp has no runtime API to hand a plugin its
+`/settings` values). It can be **YAML or JSON** — the config dir is searched in this order and the
+first match wins:
 
 ```
-$PI_CODING_AGENT_DIR/omp-warden/config.json      # default ~/.omp/agent/omp-warden/config.json
+$PI_CODING_AGENT_DIR/omp-warden/config.yaml   # default ~/.omp/agent/omp-warden/config.yaml
+                                config.yml
+                                config.json
 ```
 
-Keys:
+Copy `config.example.yaml` (or `config.example.jsonc`) and keep only the keys you change. YAML is
+handy for multi-line `question` strings. Everything is optional — omit a key for its default.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `true` | Turn the gate off and let native approval decide alone. |
-| `whitelist` | reads, search, todo, task, … | Tools never scored (native approval still applies). |
-| `judgeRole` | `"judge"` | omp model role for the stage-1 classifier. |
-| `llmRole` | `"default"` | omp model role for the stage-2 chat fallback. |
-| `onNoAnswer` | `"block"` | When neither stage answers: `block` \| `ask` \| `allow`. |
+| `debug` | `false` | Print each checked call and the classifier's score to chat. |
+| `whitelist` | reads, search, todo, task, … | Tools never scored (native approval still applies). Omit for the built-in list. |
+| `judgeRole` | `"judge"` | Stage-1 classifier model role. `null` disables the classifier stage. |
+| `llmRole` | `"smol"` | Stage-2 chat model role; falls back to `default`. `null` disables the llm stage. |
+| `onNoAnswer` | `"block"` | When a stage can't answer: `block` \| `ask` \| `allow`. |
 | `timeoutMs` | `20000` | Per-model-call timeout. |
 | `maxTokens` | `512` | Reply budget for the stage-2 chat model. |
-| `rules[]` | one `*` rule | `name`, `tools[]`, `allowBelow`, `blockAbove`, `question`, `includeContext`. |
+| `rules[]` | one `*` rule | `name`, `tools[]`, `allowBelow`, `blockAbove`, `question`, `includeContext` (all but a question optional). |
 
-A config with any error is ignored as a whole (the defaults are used), so a typo can't half-apply.
+Set `judgeRole`/`llmRole` to `null` to run **classifier-only**, **llm-only**, or (both `null`)
+leave every in-scope call to native approval. A config with any error is ignored as a whole (the
+defaults are used), so a typo can't half-apply.
 
 ### `/settings`
 

@@ -5,7 +5,8 @@
 // the plugin lock file and project overrides, and overlaid on the file config for the handful
 // of scalar settings the manifest exposes.
 
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 
@@ -56,8 +57,11 @@ export interface Config {
 const HOME = os.homedir();
 
 export const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? path.join(HOME, ".omp/agent");
-export const CONFIG_FILE = path.join(AGENT_DIR, "omp-warden", "config.json");
+export const CONFIG_DIR = path.join(AGENT_DIR, "omp-warden");
+// Config file basenames, in precedence order. A YAML file wins over JSON when both exist.
+const CONFIG_BASENAMES = ["config.yaml", "config.yml", "config.json"];
 
+const requireFrom = createRequire(import.meta.url);
 const PLUGIN_NAME = "omp-warden";
 const LOCK_FILE = path.join(HOME, ".omp/plugins/omp-plugins.lock.json");
 
@@ -252,7 +256,17 @@ export function validateConfig(raw: unknown): { config: Config; error?: string }
   return { config };
 }
 
-function readJsonFile(file: string): { value?: unknown; error?: string } {
+// Parses config text by extension: YAML for .yaml/.yml (via the `yaml` package, required lazily so
+// a JSON-only setup never needs it), JSON otherwise.
+function parseConfigText(file: string, text: string): unknown {
+  if (file.endsWith(".yaml") || file.endsWith(".yml")) {
+    const yaml = requireFrom("yaml") as { parse(text: string): unknown };
+    return yaml.parse(text);
+  }
+  return JSON.parse(text);
+}
+
+function readConfigFile(file: string): { value?: unknown; error?: string } {
   let text: string;
   try {
     text = readFileSync(file, "utf8");
@@ -264,7 +278,7 @@ function readJsonFile(file: string): { value?: unknown; error?: string } {
     return { error: `cannot read ${file}: ${err.message}` };
   }
   try {
-    return { value: JSON.parse(text) };
+    return { value: parseConfigText(file, text) };
   } catch (e) {
     return { error: `cannot parse ${file}: ${(e as Error).message}` };
   }
@@ -327,27 +341,39 @@ function projectOverrideFile(): string {
   return path.join(process.cwd(), ".omp", "plugin-overrides.json");
 }
 
-// Reads and validates the plugin config, then overlays any /settings values stored by omp.
-// A config with any error is ignored as a whole and the defaults are used instead.
-export function loadConfig(file: string = CONFIG_FILE): { config: Config; error?: string } {
-  const read = readJsonFile(file);
-  if (read.error) {
-    return { config: structuredClone(DEFAULTS), error: read.error };
+// The first config file that exists in the omp-warden config dir, in precedence order.
+function firstConfigFile(): string | undefined {
+  for (const name of CONFIG_BASENAMES) {
+    const candidate = path.join(CONFIG_DIR, name);
+    if (existsSync(candidate)) {
+      return candidate;
+    }
   }
+  return undefined;
+}
 
-  let config: Config;
+// Reads and validates the plugin config (YAML or JSON), then overlays any /settings values stored
+// by omp. A config with any error is ignored as a whole and the defaults are used instead. Pass an
+// explicit `file` to load a specific path (used by tests); otherwise the config dir is searched.
+export function loadConfig(file?: string): { config: Config; error?: string } {
+  const target = file ?? firstConfigFile();
+  let config = structuredClone(DEFAULTS);
   let error: string | undefined;
-  if (read.value === undefined) {
-    config = structuredClone(DEFAULTS);
-  } else {
-    const validated = validateConfig(read.value);
-    config = validated.config;
-    error = validated.error;
+
+  if (target !== undefined) {
+    const read = readConfigFile(target);
+    if (read.error) {
+      error = read.error;
+    } else if (read.value !== undefined) {
+      const validated = validateConfig(read.value);
+      config = validated.config;
+      error = validated.error;
+    }
   }
 
   // The global lock file first, then project overrides, which take precedence.
   for (const overrideFile of [LOCK_FILE, projectOverrideFile()]) {
-    const overrideRead = readJsonFile(overrideFile);
+    const overrideRead = readConfigFile(overrideFile);
     if (!overrideRead.error) {
       applyScalarOverrides(config, pluginSettingsFrom(overrideRead.value));
     }

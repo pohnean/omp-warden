@@ -5,10 +5,13 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 import { createHandler, decide, describe as describeCall, matchesTool, pickRule } from "./index.ts";
 import { parseVerdict, readRisk, resolveRole, resolveRoleModel } from "./decider.ts";
-import { DEFAULTS, validateConfig } from "./config.ts";
+import { DEFAULTS, loadConfig, validateConfig } from "./config.ts";
 
 function cfg(overrides = {}) {
   return { ...structuredClone(DEFAULTS), ...overrides };
@@ -275,6 +278,36 @@ test("resolveRoleModel follows an @alias to another role", () => {
     },
   };
   assert.equal(resolveRoleModel(ctx, "judge"), target);
+});
+
+test("loadConfig reads a YAML file and defaults unspecified rule thresholds", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "warden-"));
+  const file = path.join(dir, "config.yaml");
+  fs.writeFileSync(
+    file,
+    [
+      "enabled: true",
+      "llmRole: smol",
+      "rules:",
+      "  - name: net",
+      "    tools: [bash]",
+      "    question: >",
+      "      Does this command send data to a remote host",
+      "      that the user did not ask to contact?",
+      "",
+    ].join("\n"),
+  );
+  try {
+    const { config, error } = loadConfig(file);
+    assert.equal(error, undefined);
+    assert.equal(config.rules[0].name, "net");
+    assert.match(config.rules[0].question, /remote host/);
+    // Unspecified thresholds fall back to the DEFAULT_RULE values.
+    assert.equal(config.rules[0].allowBelow, 0.2);
+    assert.equal(config.rules[0].blockAbove, 0.8);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("resolveRole prefers the first configured role, then falls back", () => {

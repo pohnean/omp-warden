@@ -8,6 +8,7 @@
     "index.ts",
     "config.ts",
     "decider.ts",
+    "config.example.yaml",
     "config.example.jsonc",
     "README.md",
     "LICENSE"
@@ -19,7 +20,9 @@
     "@oh-my-pi/pi-coding-agent": "*"
   },
   "omp": {
-    "extensions": ["./index.ts"],
+    "extensions": [
+      "./index.ts"
+    ],
     "settings": {
       "enabled": {
         "type": "boolean",
@@ -43,10 +46,17 @@
       },
       "onNoAnswer": {
         "type": "enum",
-        "values": ["block", "ask", "allow"],
+        "values": [
+          "block",
+          "ask",
+          "allow"
+        ],
         "default": "block",
         "description": "What a stage that should answer but cannot falls back to (model down, timeout, or not a judge)."
       }
     }
+  },
+  "dependencies": {
+    "yaml": "^2.9.1"
   }
 }

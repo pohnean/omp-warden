@@ -1,0 +1,47 @@
+# omp-warden config (YAML). Save as one of, in precedence order:
+#   $PI_CODING_AGENT_DIR/omp-warden/config.yaml   (default ~/.omp/agent/omp-warden/config.yaml)
+#   config.yml, or config.json
+# Everything is optional — omit a key to use its default. A config with any error is ignored as a
+# whole (the defaults are used), so a single typo can never half-apply. The scalar keys can also be
+# set via `omp /settings` -> Plugins -> omp-warden (those override this file); the lists are
+# file-only.
+
+# Turn the gate on or off. When off, omp's native approval decides alone.
+enabled: true
+
+# Print a line to chat for each call checked, including the classifier's score.
+debug: false
+
+# The two stages are independent. Set a role, or null to turn that stage off:
+#   both set        -> classifier, then the llm for the uncertain middle band
+#   judgeRole only  -> classifier only (block above blockAbove, otherwise run)
+#   llmRole only    -> the llm judges every in-scope call
+#   both null       -> nothing scored; native approval decides
+judgeRole: judge   # stage 1: a native judge model role (e.g. modelRoles.judge: local/lfm2-1.2b)
+llmRole: smol      # stage 2: a chat model role; falls back to the "default" role when unset
+
+# What a stage that should answer but cannot falls back to: block | ask | allow
+onNoAnswer: block
+
+# Per-model-call timeout (ms) and the stage-2 reply budget.
+timeoutMs: 20000
+maxTokens: 512
+
+# Optional. Tools never scored (native approval still applies). Omit to use the built-in default:
+# read, grep, glob, find, ast_grep, lsp, todo, ask, task, think, wait, yield.
+# whitelist: [read, grep, glob]
+
+# Rules are tried in order; the first whose `tools` match the call decides it. A rule can be just a
+# name + question — tools default to ["*"], allowBelow to 0.2, blockAbove to 0.8, includeContext to true.
+rules:
+  - name: default
+    # "*" matches every tool, "prefix*" matches by prefix, or an exact tool name.
+    tools: ["*"]
+    # Risk in [0, 1]: < allowBelow runs; > blockAbove is blocked; in between goes to the llm stage
+    # (or just runs, when there is no llm stage).
+    allowBelow: 0.2
+    blockAbove: 0.8
+    includeContext: true
+    question: >
+      Could this tool call exfiltrate data, change a production system, or destroy data
+      that the user did not explicitly ask to change?
