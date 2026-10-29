@@ -14,7 +14,7 @@
 // Run it under `approvalMode: yolo` for a permissive default.
 
 import { createHash } from "node:crypto";
-import { appendFileSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { AGENT_DIR, CONFIG_DIR, loadConfig, parseYaml, type Config, type Rule } from "./config.ts";
@@ -32,6 +32,7 @@ import {
   type RuleScore,
   type RuleVerdict,
 } from "./decider.ts";
+import { type ContextLimits, namedFiles, readScripts } from "./transcript.ts";
 
 export interface ToolCallEvent {
   toolName: string;
@@ -53,7 +54,7 @@ export interface Engine {
   resolveRole(ctx: DeciderContext, roles: string[]): Model | undefined;
   classify(ctx: DeciderContext, model: Model, rules: Rule[], state: string, timeoutMs: number): Promise<ClassifyResult>;
   escalate(ctx: DeciderContext, model: Model, rules: Rule[], state: string, maxTokens: number, timeoutMs: number): Promise<Record<string, RuleVerdict> | undefined>;
-  conversationText(ctx: DeciderContext): string | undefined;
+  conversationText(ctx: DeciderContext, pendingId: string | undefined, limits: ContextLimits): string | undefined;
 }
 
 export const realEngine: Engine = {
@@ -118,24 +119,21 @@ function callCwd(tool: string, input: Record<string, unknown>, ctx: DeciderConte
 // A hash of every word in the command that is an existing file (e.g. `bash backup.sh`), so an
 // edited script no longer matches a call allowed for the session. Empty when it names no file.
 export function scriptHash(subject: string, cwd: string): string {
-  const hash = createHash("sha256");
-  let found = false;
-  for (const word of new Set(subject.split(/[\s;|&()<>'"`]+/))) {
-    if (word === "") {
-      continue;
-    }
-    const file = path.resolve(cwd, word);
-    try {
-      if (!statSync(file).isFile()) {
-        continue;
-      }
-      hash.update(file).update("\0").update(readFileSync(file)).update("\0");
-      found = true;
-    } catch {
-      // Not a file.
-    }
+  const files = namedFiles(subject, cwd);
+  if (files.length === 0) {
+    return "";
   }
-  return found ? hash.digest("hex").slice(0, 16) : "";
+  const hash = createHash("sha256");
+  for (const file of files) {
+    hash.update(file).update("\0");
+    try {
+      hash.update(readFileSync(file));
+    } catch {
+      // Unreadable now: hashed by name only.
+    }
+    hash.update("\0");
+  }
+  return hash.digest("hex").slice(0, 16);
 }
 
 // What "Allow for this session" remembers: this exact call — tool, folder, command text and the
@@ -146,11 +144,14 @@ export function sessionKey(tool: string, input: Record<string, unknown>, ctx: De
   return [tool, cwd, subject, scriptHash(subject, cwd)].join("\0");
 }
 
-// The `state` string the judge and the llm both see: the conversation (when includeContext) plus
-// the proposed tool call. Mirrors how the model was evaluated in the benchmark.
-export function renderState(tool: string, subject: string, conversation: string | undefined): string {
+// The `state` string the judge and the llm both see: the conversation (when includeContext), the
+// proposed tool call and the scripts it runs. The layout is the benchmark's. A multi-line call is
+// quoted, so a line inside it can't pass as the user.
+export function renderState(tool: string, subject: string, conversation: string | undefined, scripts?: string): string {
   const head = conversation ? `Conversation so far:\n${conversation}\n\n` : "";
-  return `${head}Proposed tool call (tool: ${tool}):\n${subject}`;
+  const call = subject.includes("\n") ? JSON.stringify(subject) : subject;
+  const tail = scripts ? `\n\nScripts the call runs:\n${scripts}` : "";
+  return `${head}Proposed tool call (tool: ${tool}):\n${call}${tail}`;
 }
 
 function clip(text: string, max = 200): string {
@@ -422,8 +423,9 @@ async function decideTraced(config: Config, engine: Engine, event: ToolCallEvent
     trace.lines.push(["session", "ALLOW allowed earlier in this session"]);
     return undefined;
   }
-  const conversation = config.includeContext ? engine.conversationText(ctx) : undefined;
-  const state = renderState(tool, subject, conversation);
+  const conversation = config.includeContext ? engine.conversationText(ctx, event.toolCallId, config.context) : undefined;
+  const scripts = readScripts(subject, callCwd(tool, input, ctx), config.context.scriptChars);
+  const state = renderState(tool, subject, conversation, scripts);
   emitDebug(config, trace, `checking ${tool} [${matching.map((r) => r.name).join(", ")}]: ${clip(subject)}`);
 
   const useJudge = config.judgeRole !== "";

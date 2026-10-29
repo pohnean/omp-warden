@@ -5,6 +5,7 @@
 // the plugin lock file and project overrides, and overlaid on the file config for the handful
 // of scalar settings the manifest exposes.
 
+import { type ContextLimits, DEFAULT_LIMITS } from "./transcript.ts";
 import { existsSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -61,6 +62,8 @@ export interface Config {
   llmRole: string;
   // What to do when no model can answer (model down, timeout).
   onNoAnswer: NoAnswer;
+  // What context the models get: budgets, and whether earlier tool output (quoted) is included.
+  context: ContextLimits;
   // Per-request timeout, in milliseconds.
   timeoutMs: number;
   // Reply budget for the llm stage.
@@ -112,6 +115,7 @@ export const DEFAULTS: Config = {
   judgeRole: "judge",
   llmRole: "smol",
   onNoAnswer: "block",
+  context: { ...DEFAULT_LIMITS },
   timeoutMs: 20000,
   maxTokens: 512,
   rules: [DEFAULT_RULE],
@@ -297,6 +301,34 @@ export function validateConfig(raw: unknown): { config: Config; error?: string }
         config[key] = raw[key] as number;
       } else {
         errors.push(`${key} must be a positive number`);
+      }
+    }
+  }
+  if ("context" in raw) {
+    const context = raw.context;
+    if (!isPlainObject(context)) {
+      errors.push("context must be a mapping");
+    } else {
+      for (const key of Object.keys(context)) {
+        if (!(key in DEFAULT_LIMITS)) {
+          errors.push(`context: unknown key "${key}" (allowed: ${Object.keys(DEFAULT_LIMITS).join(", ")})`);
+        }
+      }
+      for (const key of ["maxChars", "userMessageChars", "toolChars", "scriptChars"] as const) {
+        if (key in context) {
+          if (typeof context[key] === "number" && (context[key] as number) > 0) {
+            config.context[key] = context[key] as number;
+          } else {
+            errors.push(`context.${key} must be a positive number`);
+          }
+        }
+      }
+      if ("includeToolOutput" in context) {
+        if (typeof context.includeToolOutput === "boolean") {
+          config.context.includeToolOutput = context.includeToolOutput;
+        } else {
+          errors.push("context.includeToolOutput must be a boolean");
+        }
       }
     }
   }
