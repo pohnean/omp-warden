@@ -32,11 +32,16 @@ export interface Rule {
 export interface Config {
   // Starting state. A false value turns the gate off and lets native omp approval decide alone.
   enabled: boolean;
-  // Tools that are never scored (native omp approval still applies). Overridable.
+  // Print a line to chat for each call checked, including the classifier's score.
+  debug: boolean;
+  // Tools that are never scored (native omp approval still applies). Optional in the file; omit to
+  // use the built-in default list.
   whitelist: string[];
   // The omp model role whose model scores stage 1 (a native judge, e.g. a local tiny model).
+  // "" disables the classifier stage. Optional in the file (defaults to "judge").
   judgeRole: string;
-  // The omp model role whose chat model decides the stage-2 fallback.
+  // The omp model role whose chat model decides stage 2; falls back to the "default" role when it
+  // is unset in omp. "" disables the llm stage. Optional in the file (defaults to "smol").
   llmRole: string;
   // What to do when neither stage can answer (model down, timeout, not a judge).
   onNoAnswer: NoAnswer;
@@ -68,11 +73,12 @@ export const DEFAULT_RULE: Rule = {
 
 export const DEFAULTS: Config = {
   enabled: true,
+  debug: false,
   // Read-only and bookkeeping tools: searching, todos, questions to the user, subagents (whose
   // own calls come through this hook one by one), and thinking.
   whitelist: ["read", "grep", "glob", "find", "ast_grep", "lsp", "todo", "ask", "task", "think", "wait", "yield"],
   judgeRole: "judge",
-  llmRole: "default",
+  llmRole: "smol",
   onNoAnswer: "block",
   timeoutMs: 20000,
   maxTokens: 512,
@@ -89,6 +95,17 @@ function isStringArray(value: unknown): value is string[] {
 
 function isFraction(value: unknown): value is number {
   return typeof value === "number" && value >= 0 && value <= 1;
+}
+
+// A model-role config value: a role name, or null/"" to disable that stage. Returns "" for disabled.
+function optionalRole(value: unknown): { value?: string; error?: string } {
+  if (value === null || value === "") {
+    return { value: "" };
+  }
+  if (typeof value === "string") {
+    return { value };
+  }
+  return { error: "must be a role name string, or null to disable the stage" };
 }
 
 function validateRule(value: unknown, index: number): { rule?: Rule; error?: string } {
@@ -176,18 +193,27 @@ export function validateConfig(raw: unknown): { config: Config; error?: string }
       errors.push("whitelist must be an array of strings");
     }
   }
-  if ("judgeRole" in raw) {
-    if (typeof raw.judgeRole === "string" && raw.judgeRole.length > 0) {
-      config.judgeRole = raw.judgeRole;
+  if ("debug" in raw) {
+    if (typeof raw.debug === "boolean") {
+      config.debug = raw.debug;
     } else {
-      errors.push("judgeRole must be a non-empty string");
+      errors.push("debug must be a boolean");
+    }
+  }
+  if ("judgeRole" in raw) {
+    const role = optionalRole(raw.judgeRole);
+    if (role.error) {
+      errors.push(`judgeRole ${role.error}`);
+    } else {
+      config.judgeRole = role.value as string;
     }
   }
   if ("llmRole" in raw) {
-    if (typeof raw.llmRole === "string" && raw.llmRole.length > 0) {
-      config.llmRole = raw.llmRole;
+    const role = optionalRole(raw.llmRole);
+    if (role.error) {
+      errors.push(`llmRole ${role.error}`);
     } else {
-      errors.push("llmRole must be a non-empty string");
+      config.llmRole = role.value as string;
     }
   }
   if ("onNoAnswer" in raw) {
@@ -273,11 +299,18 @@ function applyScalarOverrides(config: Config, settings: Record<string, unknown> 
   if (typeof settings.enabled === "boolean") {
     config.enabled = settings.enabled;
   }
-  if (typeof settings.judgeRole === "string" && settings.judgeRole.length > 0) {
-    config.judgeRole = settings.judgeRole;
+  if (typeof settings.debug === "boolean") {
+    config.debug = settings.debug;
   }
-  if (typeof settings.llmRole === "string" && settings.llmRole.length > 0) {
+  if (typeof settings.judgeRole === "string") {
+    config.judgeRole = settings.judgeRole;
+  } else if (settings.judgeRole === null) {
+    config.judgeRole = "";
+  }
+  if (typeof settings.llmRole === "string") {
     config.llmRole = settings.llmRole;
+  } else if (settings.llmRole === null) {
+    config.llmRole = "";
   }
   if (NO_ANSWER_VALUES.includes(settings.onNoAnswer as NoAnswer)) {
     config.onNoAnswer = settings.onNoAnswer as NoAnswer;

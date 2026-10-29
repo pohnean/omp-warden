@@ -26,21 +26,26 @@
         "default": true,
         "description": "Turn the classifier gate on or off. When off, omp's native approval decides alone."
       },
+      "debug": {
+        "type": "boolean",
+        "default": false,
+        "description": "Print a line to chat for each call checked, including the classifier's score."
+      },
       "judgeRole": {
         "type": "string",
         "default": "judge",
-        "description": "omp model role whose model scores stage 1 (a native judge, e.g. a local tiny model)."
+        "description": "Stage-1 model role (a native judge, e.g. a local tiny model). Empty disables the classifier stage."
       },
       "llmRole": {
         "type": "string",
-        "default": "default",
-        "description": "omp model role whose chat model decides the stage-2 fallback."
+        "default": "smol",
+        "description": "Stage-2 chat model role; falls back to the 'default' role when unset in omp. Empty disables the llm stage."
       },
       "onNoAnswer": {
         "type": "enum",
         "values": ["block", "ask", "allow"],
         "default": "block",
-        "description": "What to do when neither stage can answer (model down, timeout, or not a judge)."
+        "description": "What a stage that should answer but cannot falls back to (model down, timeout, or not a judge)."
       }
     }
   }

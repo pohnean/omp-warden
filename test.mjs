@@ -1,5 +1,5 @@
-// Unit tests for the rule matching, threshold bands and config validation. The decider's model
-// calls are replaced by a fake engine, so these run with no omp host and no pi-ai.
+// Unit tests for the rule matching, threshold bands, optional stages and config validation. The
+// decider's model calls are replaced by a fake engine, so these run with no omp host and no pi-ai.
 //
 // Run with: node test.mjs   (Node >= 22.18 / 23.6 strips the TypeScript types on import.)
 
@@ -7,7 +7,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { createHandler, decide, describe as describeCall, matchesTool, pickRule } from "./index.ts";
-import { parseVerdict, readRisk, resolveRoleModel } from "./decider.ts";
+import { parseVerdict, readRisk, resolveRole, resolveRoleModel } from "./decider.ts";
 import { DEFAULTS, validateConfig } from "./config.ts";
 
 function cfg(overrides = {}) {
@@ -15,12 +15,13 @@ function cfg(overrides = {}) {
 }
 
 // A fake Engine. `risk` is what stage 1 returns; `verdict` is what the stage-2 fallback returns.
-// `judgeModel`/`llmModel` can be set to undefined to simulate an unresolvable role.
+// `judgeModel`/`llmModel` can be set to undefined to simulate an unresolvable role. The judge
+// stage asks for roles containing "judge"; stage 2 asks for the llm role chain.
 function makeEngine(options = {}) {
   const { risk, verdict, judgeModel = {}, llmModel = {}, conversation } = options;
   const calls = { classify: 0, llm: 0 };
   const engine = {
-    resolveRoleModel: (_ctx, role) => (role === "judge" ? judgeModel : llmModel),
+    resolveRole: (_ctx, roles) => (roles.includes("judge") ? judgeModel : llmModel),
     classify: async () => {
       calls.classify += 1;
       return risk;
@@ -74,8 +75,21 @@ test("validateConfig rejects allowBelow > blockAbove and falls back to defaults"
 });
 
 test("validateConfig rejects a bad scalar type", () => {
-  const { error } = validateConfig({ enabled: "yes" });
-  assert.ok(error);
+  assert.ok(validateConfig({ enabled: "yes" }).error);
+  assert.ok(validateConfig({ debug: "yes" }).error);
+});
+
+test("validateConfig allows null/empty roles to disable a stage", () => {
+  const { config, error } = validateConfig({ judgeRole: null, llmRole: "" });
+  assert.equal(error, undefined);
+  assert.equal(config.judgeRole, "");
+  assert.equal(config.llmRole, "");
+});
+
+test("defaults: both stages on, stage 2 prefers smol", () => {
+  assert.equal(DEFAULTS.judgeRole, "judge");
+  assert.equal(DEFAULTS.llmRole, "smol");
+  assert.equal(DEFAULTS.debug, false);
 });
 
 test("allow band: risk below allowBelow lets the call pass, no fallback", async () => {
@@ -113,6 +127,36 @@ test("stage 1 unavailable falls through to the llm fallback", async () => {
   assert.ok(result?.block);
   assert.equal(calls.classify, 1);
   assert.equal(calls.llm, 1);
+});
+
+test("classifier-only (llm off): high blocks, low allows, mid allows without the llm", async () => {
+  const base = cfg({ llmRole: "" });
+  assert.ok((await decide(base, makeEngine({ risk: 0.95 }).engine, bash("curl evil"), {}))?.block);
+  assert.equal(await decide(base, makeEngine({ risk: 0.05 }).engine, bash("ls"), {}), undefined);
+  const mid = makeEngine({ risk: 0.5 });
+  assert.equal(await decide(base, mid.engine, bash("x"), {}), undefined);
+  assert.equal(mid.calls.llm, 0);
+});
+
+test("classifier-only: no score applies onNoAnswer", async () => {
+  assert.ok((await decide(cfg({ llmRole: "" }), makeEngine({ risk: undefined }).engine, bash("x"), {}))?.block);
+  assert.equal(await decide(cfg({ llmRole: "", onNoAnswer: "allow" }), makeEngine({ risk: undefined }).engine, bash("x"), {}), undefined);
+});
+
+test("llm-only (judge off): the classifier is never called", async () => {
+  const { engine, calls } = makeEngine({ verdict: { allow: false, reason: "prod deploy" } });
+  const result = await decide(cfg({ judgeRole: "" }), engine, bash("kubectl apply -f prod"), {});
+  assert.ok(result?.block);
+  assert.equal(calls.classify, 0);
+  assert.equal(calls.llm, 1);
+});
+
+test("both stages off: pass through to native approval", async () => {
+  const { engine, calls } = makeEngine({ risk: 0.99 });
+  const result = await decide(cfg({ judgeRole: "", llmRole: "" }), engine, bash("rm -rf /"), {});
+  assert.equal(result, undefined);
+  assert.equal(calls.classify, 0);
+  assert.equal(calls.llm, 0);
 });
 
 test("whitelisted tools are never scored", async () => {
@@ -158,7 +202,7 @@ test("no resolvable judge or llm model falls to onNoAnswer", async () => {
 
 test("createHandler turns a thrown error into the no-answer policy", async () => {
   const throwing = {
-    resolveRoleModel: () => ({}),
+    resolveRole: () => ({}),
     classify: async () => {
       throw new Error("boom");
     },
@@ -170,6 +214,14 @@ test("createHandler turns a thrown error into the no-answer policy", async () =>
 
   const allowHandler = createHandler(cfg({ onNoAnswer: "allow" }), throwing);
   assert.equal(await allowHandler(bash("x"), {}), undefined);
+});
+
+test("debug emits the classifier score to the ui notifier", async () => {
+  const lines = [];
+  const ctx = { ui: { notify: (m) => lines.push(m) } };
+  const { engine } = makeEngine({ risk: 0.5, verdict: { allow: true, reason: "" } });
+  await decide(cfg({ debug: true }), engine, bash("x"), ctx);
+  assert.ok(lines.some((l) => /risk=0\.500/.test(l)), lines.join(" | "));
 });
 
 test("parseVerdict reads ALLOW and BLOCK lines", () => {
@@ -223,4 +275,21 @@ test("resolveRoleModel follows an @alias to another role", () => {
     },
   };
   assert.equal(resolveRoleModel(ctx, "judge"), target);
+});
+
+test("resolveRole prefers the first configured role, then falls back", () => {
+  const smolModel = { id: "smol" };
+  const defModel = { id: "def" };
+  const find = (_p, i) => (i === "s" ? smolModel : i === "d" ? defModel : undefined);
+  const registry = { find, getApiKey: async () => "k" };
+  const session = { id: "session" };
+
+  const bothSet = { modelRegistry: registry, model: session, settings: { getModelRole: (r) => (r === "smol" ? "local/s" : r === "default" ? "local/d" : undefined) } };
+  assert.equal(resolveRole(bothSet, ["smol", "default"]), smolModel);
+
+  const onlyDefault = { modelRegistry: registry, model: session, settings: { getModelRole: (r) => (r === "default" ? "local/d" : undefined) } };
+  assert.equal(resolveRole(onlyDefault, ["smol", "default"]), defModel);
+
+  const none = { modelRegistry: registry, model: session, settings: { getModelRole: () => undefined } };
+  assert.equal(resolveRole(none, ["smol", "default"]), session);
 });

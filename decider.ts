@@ -31,7 +31,7 @@ export interface DeciderContext {
   signal?: AbortSignal;
   hasUI?: boolean;
   sessionManager?: { getBranch?(): unknown };
-  ui?: { confirm?(message: string): Promise<boolean> };
+  ui?: { confirm?(message: string): Promise<boolean>; notify?(message: string, level?: string): void };
 }
 
 interface PiAi {
@@ -108,6 +108,24 @@ export function resolveRoleModel(ctx: DeciderContext, role: string, seen: Set<st
     return found;
   }
   return session;
+}
+
+// Resolves the first role in `roles` that the host actually has configured, so a preferred role
+// (e.g. "smol") can fall back to a later one (e.g. "default") when it is unset. Falls back to the
+// session's own model when none of the roles are configured.
+export function resolveRole(ctx: DeciderContext, roles: string[]): Model | undefined {
+  for (const role of roles) {
+    let spec: string | undefined;
+    try {
+      spec = ctx.settings?.getModelRole?.(role);
+    } catch {
+      spec = undefined;
+    }
+    if (spec) {
+      return resolveRoleModel(ctx, role);
+    }
+  }
+  return ctx.model;
 }
 
 // Reads the risk fraction from a native judge's answer to the "risky" question. Undefined when
