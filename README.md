@@ -41,6 +41,11 @@ request**, and the worst verdict wins — the tripped rule's `description` is th
 3. If neither stage answers, `onNoAnswer` decides (`block` by default). Without a UI an `ask`
    blocks — a subagent can't be prompted.
 
+An ask offers **Allow once / Allow for this session / Block**. "For this session" remembers the
+exact call — tool, working directory, command text and the contents of any file the command names
+(e.g. `bash backup.sh`) — and lets it through without a model call until omp exits; any difference
+asks again. It is in memory only, and a block is never offered it.
+
 Every rule has the same shape: a question and what allow / ask / block mean for it (see
 [Rules](#rules)). Set `judgeRole`/`llmRole` to `null` to run classifier-only, llm-only, or (both
 `null`) leave everything to native omp.
