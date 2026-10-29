@@ -239,7 +239,7 @@ export function parseEscalation(text: string): EscalationResult {
     .map((line) => line.trim())
     .filter((line) => line.length > 0)
     .join(" ")
-    .slice(0, 240);
+    .slice(0, 600);
   return { verdict, reason };
 }
 

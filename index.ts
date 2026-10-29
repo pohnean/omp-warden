@@ -292,7 +292,7 @@ export async function decide(config: Config, engine: Engine, event: ToolCallEven
     emitDebug(config, ctx, "stage 2 llm: no answer");
     return onNoAnswer(config, ctx);
   }
-  emitDebug(config, ctx, `stage 2 llm: ${result.verdict}${result.reason ? ` — ${clip(result.reason, 80)}` : ""}`);
+  emitDebug(config, ctx, `stage 2 llm: ${result.verdict}${result.reason ? ` — ${result.reason}` : ""}`);
   if (result.verdict === "allow") {
     return undefined;
   }
