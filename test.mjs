@@ -371,28 +371,26 @@ test("loadConfig reads a YAML file and defaults the thresholds", () => {
   }
 });
 
-test("debug: one notification per call with each rule's score, P(block) only where it can block", async () => {
+test("debug: classifier line — verdict, each rule's score (P(block) only where it can block), time", async () => {
   const notes = [];
   const ctx = { hasUI: true, ui: { notify: (m) => notes.push(m), confirm: async () => true } };
   const rules = [exfilRule(), { ...DEFAULT_RULE }];
   const { engine } = makeEngine({ scores: { exfil: { risk: 0.048, pBlock: 0.9 }, "auto-mode": { risk: 0.02, pBlock: 0.01 } } });
   await decide(cfg({ debug: true, rules }), engine, bash("uname -a"), ctx);
   assert.equal(notes.length, 1);
-  assert.match(notes[0], /^\[omp-warden\] block exfil · bash: uname -a · exfil \.05 b\.90 · auto-mode \.02 · \d+ms$/);
+  assert.match(notes[0], /^\[omp-warden\] classifier: BLOCK exfil: \.05 b\.90, auto-mode: \.02 \d+ms$/);
 });
 
-test("debug: an llm verdict is appended to the rule's score", async () => {
+test("debug: an llm line under the classifier line, with the llm's verdict and reason", async () => {
   const notes = [];
   const ctx = { hasUI: true, ui: { notify: (m) => notes.push(m) } };
   const { engine } = makeEngine({ scores: auto(0.15), verdict: { verdict: "allow", reason: "lists files only" } });
   await decide(cfg({ debug: true }), engine, bash("ls"), ctx);
   assert.equal(notes.length, 1);
-  const [summary, ...details] = notes[0].split("\n");
-  assert.match(summary, /allow \(llm\) · bash: ls · auto-mode \.15→allow · \d+ms$/);
-  const text = details.join("\n");
-  assert.match(text, /stage 1: auto-mode risk=0\.150 → unsure \(allowBelow 0\.1 ≤ risk < askAbove 0\.2\)/);
-  assert.match(text, /stage 2 llm: llm on auto-mode, \d+ms/);
-  assert.match(text, /stage 2 llm: auto-mode allow — /);
+  const lines = notes[0].split("\n");
+  assert.equal(lines.length, 2);
+  assert.match(lines[0], /^\[omp-warden\] classifier: UNSURE auto-mode: \.15 \d+ms$/);
+  assert.match(lines[1], /^\[omp-warden\]        llm: ALLOW auto-mode: lists files only \d+ms$/);
 });
 
 test("debug: without the llm stage the notification stays one line", async () => {
@@ -483,8 +481,8 @@ test("session: the debug summary says allow (session); the handler keeps one set
   await handler(bash("git push"), ctx);
   await handler(bash("git push"), ctx);
   assert.equal(calls.classify, 1);
-  assert.match(notes[0], /ask auto-mode → session/);
-  assert.match(notes[1], /^\[omp-warden\] allow \(session\) · bash: git push · \d+ms$/);
+  assert.match(notes[0], /classifier: ASK auto-mode: \.60/);
+  assert.equal(notes[1], "[omp-warden] session: ALLOW allowed earlier in this session");
 });
 
 test("debug: the time shown excludes waiting for the user", async () => {
