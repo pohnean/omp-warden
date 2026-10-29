@@ -486,3 +486,12 @@ test("session: the debug summary says allow (session); the handler keeps one set
   assert.match(notes[0], /ask auto-mode → session/);
   assert.match(notes[1], /^\[omp-warden\] allow \(session\) · bash: git push · \d+ms$/);
 });
+
+test("debug: the time shown excludes waiting for the user", async () => {
+  const notes = [];
+  const ctx = { hasUI: true, ui: { notify: (m) => notes.push(m), select: () => new Promise((resolve) => setTimeout(() => resolve("Allow once"), 120)) } };
+  const { engine } = makeEngine({ scores: auto(0.6) });
+  await decide(cfg({ debug: true }), engine, bash("git push"), ctx);
+  const ms = Number(notes[0].match(/ (\d+)ms$/)[1]);
+  assert.ok(ms < 100, `took ${ms}ms`);
+});

@@ -167,6 +167,8 @@ function bandOf(rule: Rule, score: RuleScore | undefined, useLlm: boolean): Band
 // llm's verdict when it was asked), the outcome and the time taken.
 interface Trace {
   started: number;
+  // Set when the decision is made, before any dialog: the time shown is the models', not the user's.
+  decidedMs?: number;
   head: string;
   parts: Map<string, string>;
   outcome?: string;
@@ -240,7 +242,7 @@ function emitSummary(config: Config, ctx: DeciderContext, trace: Trace): void {
     return;
   }
   const scores = [...trace.parts].map(([name, part]) => `${name} ${part}`);
-  const line = ["[omp-warden]", trace.outcome ?? "allow", "·", [trace.head, ...scores, `${Date.now() - trace.started}ms`].join(" · ")].join(" ");
+  const line = ["[omp-warden]", trace.outcome ?? "allow", "·", [trace.head, ...scores, `${trace.decidedMs ?? Date.now() - trace.started}ms`].join(" · ")].join(" ");
   appendDebugLog(line);
   const shown = trace.escalated ? [line, ...trace.details.map((detail) => `  ${detail}`)].join("\n") : line;
   try {
@@ -340,6 +342,7 @@ async function act(config: Config, ctx: DeciderContext, finding: Finding, tool: 
     return { block: true, reason: `omp-warden blocked this call — ${label}: ${finding.reason} (${scores}). ${ASK_LINE}` };
   }
   const message = `${finding.reason}\n\n${tool}: ${clip(subject, 300)}`;
+  trace.decidedMs = Date.now() - trace.started;
   const choice = await askUser(ctx, `omp-warden: ${label}`, message);
   if (choice === "session") {
     onSession();
@@ -360,6 +363,9 @@ async function onNoAnswer(config: Config, ctx: DeciderContext, trace?: Trace): P
     return undefined;
   }
   if (config.onNoAnswer === "ask") {
+    if (trace) {
+      trace.decidedMs = Date.now() - trace.started;
+    }
     const approved = await confirmWithUser(ctx, "omp-warden: could not evaluate this call", "No model answered (down or timed out).\n\nRun it anyway?");
     if (trace) {
       trace.outcome = `no answer → ask → ${approved ? "approved" : "blocked"}`;
