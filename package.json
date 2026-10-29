@@ -1,0 +1,47 @@
+{
+  "name": "omp-warden",
+  "version": "0.1.0",
+  "description": "A configurable model-classifier gate for oh-my-pi (omp) tool calls, layered on omp's native approval.",
+  "type": "module",
+  "license": "MIT",
+  "files": [
+    "index.ts",
+    "config.ts",
+    "decider.ts",
+    "config.example.jsonc",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node test.mjs"
+  },
+  "peerDependencies": {
+    "@oh-my-pi/pi-coding-agent": "*"
+  },
+  "omp": {
+    "extensions": ["./index.ts"],
+    "settings": {
+      "enabled": {
+        "type": "boolean",
+        "default": true,
+        "description": "Turn the classifier gate on or off. When off, omp's native approval decides alone."
+      },
+      "judgeRole": {
+        "type": "string",
+        "default": "judge",
+        "description": "omp model role whose model scores stage 1 (a native judge, e.g. a local tiny model)."
+      },
+      "llmRole": {
+        "type": "string",
+        "default": "default",
+        "description": "omp model role whose chat model decides the stage-2 fallback."
+      },
+      "onNoAnswer": {
+        "type": "enum",
+        "values": ["block", "ask", "allow"],
+        "default": "block",
+        "description": "What to do when neither stage can answer (model down, timeout, or not a judge)."
+      }
+    }
+  }
+}

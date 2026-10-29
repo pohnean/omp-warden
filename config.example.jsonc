@@ -1,0 +1,59 @@
+// Every key of the live config, set to its default.
+//
+// The live config file is plain JSON at:
+//   $PI_CODING_AGENT_DIR/omp-warden/config.json   (default ~/.omp/agent/omp-warden/config.json)
+// Drop these comments and keep only the keys you change. A config with any error is ignored as a
+// whole (the defaults are used), so a single typo can never half-apply.
+//
+// The scalar keys below (enabled, judgeRole, llmRole, onNoAnswer) can also be set through
+// `omp /settings` -> Plugins -> omp-warden, or `omp plugin config`. Those values override
+// this file. The arrays (whitelist, rules) are file-only.
+{
+  // Turn the gate on or off. When off, omp's native approval decides alone.
+  "enabled": true,
+
+  // Tools that are never scored. omp's native approval still applies to them. Reads, searches,
+  // todos, questions to the user, and subagents (whose own calls come back through this hook).
+  "whitelist": ["read", "grep", "glob", "find", "ast_grep", "lsp", "todo", "ask", "task", "think", "wait", "yield"],
+
+  // The omp model role that scores stage 1. Point it at a local native judge, for example:
+  //   modelRoles:
+  //     judge: local/lfm2-1.2b
+  "judgeRole": "judge",
+
+  // The omp model role whose chat model decides the stage-2 fallback (the band between a rule's
+  // thresholds, and anything stage 1 could not score). For example modelRoles.default.
+  "llmRole": "default",
+
+  // What to do when neither stage can answer: "block" (default), "ask" (prompt if there is a UI),
+  // or "allow".
+  "onNoAnswer": "block",
+
+  // Per-model-call timeout, in milliseconds.
+  "timeoutMs": 20000,
+
+  // Reply budget for the stage-2 chat model.
+  "maxTokens": 512,
+
+  // Rules are tried in order; the first whose `tools` match the call decides it. A call that
+  // matches no rule is left entirely to native approval.
+  "rules": [
+    {
+      "name": "default",
+
+      // Tool-name patterns: "*" matches every tool, "prefix*" matches by prefix, or an exact name.
+      "tools": ["*"],
+
+      // The classifier returns a risk in [0, 1]. risk < allowBelow runs; risk > blockAbove is
+      // blocked; a risk between the two goes to the stage-2 chat model.
+      "allowBelow": 0.2,
+      "blockAbove": 0.8,
+
+      // The yes/no question the stage-1 judge answers about the call.
+      "question": "Could this tool call exfiltrate data, change a production system, or destroy data that the user did not explicitly ask to change?",
+
+      // Whether stage 1 also sees a transcript of the conversation, not just the command.
+      "includeContext": true
+    }
+  ]
+}
