@@ -16,6 +16,15 @@ includeContext: true    # send the conversation so already-authorized calls aren
 timeoutMs: 20000
 maxTokens: 512
 
+# What the models see (all optional; see README "What the models see").
+# context:
+#   maxChars: 6000          # budget for the conversation
+#   recentCalls: 5          # the agent's latest tool calls sent as recent activity
+#   askedChars: 400         # end of the agent's message sent with each of your replies
+#   toolChars: 300          # one call's input or output, clipped
+#   environment:            # facts about your setup, sent as [ENVIRONMENT] lines
+#     - prd/* cluster targets are production
+
 # Every rule has the same shape:
 #   name         unique id
 #   description  shown to you when the rule asks or blocks

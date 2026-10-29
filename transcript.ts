@@ -1,14 +1,30 @@
 // The context both stages read: the conversation, the call under review and the scripts it runs.
 //
+// The conversation is laid out as:
+//
+//   Task:
+//   [USER] <the user's first message>
+//   User messages (newest last):
+//   [AGENT ASKED] "<the end of the agent's message before it>"   (when there was one)
+//   [USER] <a later message>
+//   Recent activity:
+//   [TOOL CALL] bash "{…}" → ok
+//   [TOOL OUTPUT] bash "<clipped>"
+//   [ENVIRONMENT] <a fact from the user's config>
+//
 // It is built so text the agent wrote or read cannot pass as the user. Only the user's own messages
 // grant permission, so:
 //   - a user message is the user's typed words: an expanded skill body or an attached @file in front
 //     of them is cut out;
-//   - everything else (the agent's earlier calls, their output, script bodies) is JSON-quoted, so a
-//     newline inside it can never start a line that reads as `[USER]`;
-//   - the agent's own prose is never sent;
-//   - when the budget runs out, tool lines go first and the user's first message (the task) is
-//     always kept.
+//   - everything else (the agent's question, its calls, their output, script bodies) is JSON-quoted,
+//     so a newline inside it can never start a line that reads as `[USER]`;
+//   - the agent's prose is never sent, except the end of the message a user message replies to, so a
+//     "yes" says what it approves;
+//   - when the budget runs out, activity goes first, then the agent's questions, then the user's
+//     messages, oldest first; the task is always kept.
+//
+// The user's messages are recorded as they are sent (TurnLog), so compaction can't drop them. When
+// none were recorded (omp restarted on a resumed session), they are read from the session branch.
 
 import { readFileSync, statSync } from "node:fs";
 import path from "node:path";
@@ -24,18 +40,33 @@ export interface ContextLimits {
   scriptChars: number;
   // Send the output of the agent's earlier tool calls (quoted) as well as the calls themselves.
   includeToolOutput: boolean;
+  // How many of the agent's latest tool calls are sent as recent activity.
+  recentCalls: number;
+  // How much of the end of the agent's message before a user message is sent with it.
+  askedChars: number;
+  // Facts the user writes in the config (e.g. "prd/* targets are production"), sent as is.
+  environment: string[];
 }
 
 export const DEFAULT_LIMITS: ContextLimits = {
   maxChars: 6000,
   userMessageChars: 2000,
-  toolChars: 600,
+  toolChars: 300,
   scriptChars: 8000,
   includeToolOutput: true,
+  recentCalls: 5,
+  askedChars: 400,
+  environment: [],
 };
 
+// A message the user sent, and the end of the agent's message just before it.
+export interface UserTurn {
+  text: string;
+  askedBefore?: string;
+}
+
 export type Item =
-  | { kind: "user"; text: string }
+  | { kind: "user"; text: string; askedBefore?: string }
   | { kind: "call"; tool: string; input: unknown; outcome?: "ok" | "error" }
   | { kind: "output"; tool: string; text: string };
 
@@ -47,6 +78,14 @@ export function clipMiddle(text: string, max: number): string {
   const keep = Math.max(0, max - 20);
   const head = Math.ceil(keep / 2);
   return `${text.slice(0, head)} …(${text.length} chars)… ${text.slice(text.length - (keep - head))}`;
+}
+
+// "…xyz": keeps the end, where an agent's question usually is.
+export function clipStart(text: string, max: number): string {
+  if (text.length <= max) {
+    return text;
+  }
+  return `…${text.slice(text.length - Math.max(0, max - 1))}`;
 }
 
 // The user's own words in a user message: omp puts an expanded skill, or the files of `@file`, in
@@ -100,6 +139,8 @@ export function transcriptItems(branch: unknown[], pendingId: string | undefined
   }
 
   const items: Item[] = [];
+  // The agent's latest text since the last user message: what the next user message replies to.
+  let agentText: string | undefined;
   for (const entry of branch) {
     const message = asRecord(asRecord(entry)?.message);
     if (message === undefined) {
@@ -108,11 +149,16 @@ export function transcriptItems(branch: unknown[], pendingId: string | undefined
     if (message.role === "user") {
       const text = ownWords(textParts(message.content)).trim();
       if (text !== "") {
-        items.push({ kind: "user", text });
+        items.push({ kind: "user", text, askedBefore: agentText });
+        agentText = undefined;
       }
       continue;
     }
     if (message.role === "assistant" && Array.isArray(message.content)) {
+      const said = textParts(message.content).trim();
+      if (said !== "") {
+        agentText = said;
+      }
       for (const block of message.content) {
         const part = asRecord(block);
         if (part?.type !== "toolCall") {
@@ -152,27 +198,184 @@ function line(item: Item, limits: ContextLimits): string {
   return `[TOOL OUTPUT] ${toolName(item.tool)} ${JSON.stringify(clipMiddle(item.text, limits.toolChars))}`;
 }
 
-// The conversation as lines within the budget. Tool lines go first (oldest first), then user
-// messages (oldest first) — except the user's first message, the task, which always stays.
-export function renderTranscript(items: Item[], limits: ContextLimits): string | undefined {
-  const lines = items.map((item) => ({ user: item.kind === "user", text: line(item, limits) }));
-  const firstUser = lines.findIndex((entry) => entry.user);
+// The user's messages: the ones recorded as sent, after any older ones only the branch has (sent
+// before the plugin loaded). With none recorded, the branch's own.
+export function mergeTurns(items: Item[], recorded: UserTurn[]): UserTurn[] {
+  const fromBranch: UserTurn[] = [];
+  for (const item of items) {
+    if (item.kind === "user") {
+      fromBranch.push({ text: item.text, askedBefore: item.askedBefore });
+    }
+  }
+  if (recorded.length === 0) {
+    return fromBranch;
+  }
+  const known = new Set(recorded.map((turn) => turn.text));
+  let firstKnown = fromBranch.findIndex((turn) => known.has(turn.text));
+  if (firstKnown < 0) {
+    firstKnown = fromBranch.length;
+  }
+  return [...fromBranch.slice(0, firstKnown), ...recorded];
+}
+
+// The agent's latest tool calls (and their output), at most `count` calls.
+function recentActivity(items: Item[], count: number): Item[] {
+  const activity = items.filter((item) => item.kind !== "user");
+  const calls: number[] = [];
+  activity.forEach((item, i) => {
+    if (item.kind === "call") {
+      calls.push(i);
+    }
+  });
+  if (count <= 0) {
+    return [];
+  }
+  if (calls.length <= count) {
+    return activity;
+  }
+  return activity.slice(calls[calls.length - count]);
+}
+
+type Section = "task" | "user" | "activity" | "environment";
+type Drop = "never" | "activity" | "asked" | "user";
+interface Line {
+  section: Section;
+  drop: Drop;
+  text: string;
+}
+
+const HEADERS: Record<Section, string | undefined> = {
+  task: "Task:",
+  user: "User messages (newest last):",
+  activity: "Recent activity:",
+  environment: undefined,
+};
+
+// The conversation laid out within the budget (see the top of this file). Over budget, activity goes
+// first, then the agent's questions, then the user's messages, oldest first; the task and the
+// environment always stay.
+export function buildContext(items: Item[], recorded: UserTurn[], limits: ContextLimits): string | undefined {
+  const turns = mergeTurns(items, recorded);
+  const lines: Line[] = [];
+  turns.forEach((turn, i) => {
+    const userLine = `[USER] ${clipMiddle(turn.text, limits.userMessageChars)}`;
+    if (i === 0) {
+      lines.push({ section: "task", drop: "never", text: userLine });
+      return;
+    }
+    if (turn.askedBefore) {
+      const asked = JSON.stringify(clipStart(turn.askedBefore, limits.askedChars));
+      lines.push({ section: "user", drop: "asked", text: `[AGENT ASKED] ${asked}` });
+    }
+    lines.push({ section: "user", drop: "user", text: userLine });
+  });
+  for (const item of recentActivity(items, limits.recentCalls)) {
+    lines.push({ section: "activity", drop: "activity", text: line(item, limits) });
+  }
+  for (const fact of limits.environment) {
+    lines.push({ section: "environment", drop: "never", text: `[ENVIRONMENT] ${fact}` });
+  }
+
   const keep = lines.map(() => true);
-  let size = lines.reduce((total, entry) => total + entry.text.length + 1, 0);
-  for (const wantUser of [false, true]) {
+  const render = (): string => {
+    const out: string[] = [];
+    let section: Section | undefined;
+    lines.forEach((entry, i) => {
+      if (!keep[i]) {
+        return;
+      }
+      if (entry.section !== section) {
+        section = entry.section;
+        const header = HEADERS[section];
+        if (header !== undefined) {
+          out.push(header);
+        }
+      }
+      out.push(entry.text);
+    });
+    return out.join("\n");
+  };
+
+  let size = render().length;
+  for (const drop of ["activity", "asked", "user"] as const) {
     for (let i = 0; i < lines.length && size > limits.maxChars; i++) {
-      if (!keep[i] || lines[i].user !== wantUser || i === firstUser) {
+      if (!keep[i] || lines[i].drop !== drop) {
         continue;
       }
       keep[i] = false;
-      size -= lines[i].text.length + 1;
+      size = render().length;
     }
   }
-  const kept = lines.filter((_, i) => keep[i]).map((entry) => entry.text);
-  if (kept.length === 0) {
+  const text = render();
+  if (text === "") {
     return undefined;
   }
-  return kept.join("\n");
+  return text;
+}
+
+// The end of the agent's latest message that has text: what a message sent now replies to.
+export function lastAgentText(branch: unknown): string | undefined {
+  if (!Array.isArray(branch)) {
+    return undefined;
+  }
+  for (let i = branch.length - 1; i >= 0; i--) {
+    const message = asRecord(asRecord(branch[i])?.message);
+    if (message?.role === "user") {
+      return undefined;
+    }
+    if (message?.role === "assistant") {
+      const said = textParts(message.content).trim();
+      if (said !== "") {
+        return said;
+      }
+    }
+  }
+  return undefined;
+}
+
+interface SessionLike {
+  sessionManager?: { getBranch?(): unknown; getSessionId?(): string };
+}
+
+// Keeps at most this many messages per session (the first, the task, always stays).
+const MAX_TURNS = 100;
+
+// The user's messages per session, recorded from omp's `input` event as they are sent, with the end
+// of the agent's message before each. In memory only.
+export class TurnLog {
+  #bySession = new Map<string, UserTurn[]>();
+
+  #key(ctx: SessionLike): string {
+    try {
+      return ctx.sessionManager?.getSessionId?.() ?? "";
+    } catch {
+      return "";
+    }
+  }
+
+  record(text: string, ctx: SessionLike): void {
+    const words = ownWords(text).trim();
+    if (words === "") {
+      return;
+    }
+    let branch: unknown;
+    try {
+      branch = ctx.sessionManager?.getBranch?.();
+    } catch {
+      branch = undefined;
+    }
+    const key = this.#key(ctx);
+    const turns = this.#bySession.get(key) ?? [];
+    turns.push({ text: words, askedBefore: lastAgentText(branch) });
+    if (turns.length > MAX_TURNS) {
+      turns.splice(1, 1);
+    }
+    this.#bySession.set(key, turns);
+  }
+
+  turns(ctx: SessionLike): UserTurn[] {
+    return this.#bySession.get(this.#key(ctx)) ?? [];
+  }
 }
 
 // Every word in the command that is an existing file under or relative to `cwd` (e.g. the

@@ -8,6 +8,7 @@
     "index.ts",
     "config.ts",
     "decider.ts",
+    "transcript.ts",
     "config.example.yaml",
     "config.example.jsonc",
     "README.md",

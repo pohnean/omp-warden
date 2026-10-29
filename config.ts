@@ -115,7 +115,7 @@ export const DEFAULTS: Config = {
   judgeRole: "judge",
   llmRole: "smol",
   onNoAnswer: "block",
-  context: { ...DEFAULT_LIMITS },
+  context: { ...DEFAULT_LIMITS, environment: [...DEFAULT_LIMITS.environment] },
   timeoutMs: 20000,
   maxTokens: 512,
   rules: [DEFAULT_RULE],
@@ -314,13 +314,29 @@ export function validateConfig(raw: unknown): { config: Config; error?: string }
           errors.push(`context: unknown key "${key}" (allowed: ${Object.keys(DEFAULT_LIMITS).join(", ")})`);
         }
       }
-      for (const key of ["maxChars", "userMessageChars", "toolChars", "scriptChars"] as const) {
+      for (const key of ["maxChars", "userMessageChars", "toolChars", "scriptChars", "askedChars"] as const) {
         if (key in context) {
           if (typeof context[key] === "number" && (context[key] as number) > 0) {
             config.context[key] = context[key] as number;
           } else {
             errors.push(`context.${key} must be a positive number`);
           }
+        }
+      }
+      if ("recentCalls" in context) {
+        const value = context.recentCalls;
+        if (typeof value === "number" && Number.isInteger(value) && value >= 0) {
+          config.context.recentCalls = value;
+        } else {
+          errors.push("context.recentCalls must be a whole number, 0 or more");
+        }
+      }
+      if ("environment" in context) {
+        const value = context.environment;
+        if (Array.isArray(value) && value.every((fact) => typeof fact === "string")) {
+          config.context.environment = value.map((fact) => fact.replace(/\s+/g, " ").trim()).filter((fact) => fact !== "");
+        } else {
+          errors.push("context.environment must be a list of strings");
         }
       }
       if ("includeToolOutput" in context) {
@@ -484,10 +500,24 @@ export function parseYaml(text: string): unknown {
     if (/^[>|][+-]?$/.test(trimmed)) {
       return blockScalar(trimmed, parentIndent);
     }
-    if (trimmed === "") {
-      return block(parentIndent + 1);
+    // Nothing after the colon but maybe a comment: the value is the block below.
+    if (trimmed === "" || trimmed.startsWith("#")) {
+      return nested(parentIndent);
     }
     return scalar(trimmed);
+  }
+
+  // The block under a key at `keyIndent`: indented deeper, or a "- item" list at the key's own indent.
+  function nested(keyIndent: number): unknown {
+    let j = i;
+    while (j < lines.length && isBlank(lines[j])) {
+      j += 1;
+    }
+    if (j < lines.length && indentOf(lines[j]) === keyIndent && lines[j].slice(keyIndent).startsWith("- ")) {
+      i = j;
+      return sequence(keyIndent);
+    }
+    return block(keyIndent + 1);
   }
 
   function colonAt(s: string): number {

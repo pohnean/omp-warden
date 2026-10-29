@@ -32,7 +32,7 @@ import {
   type RuleScore,
   type RuleVerdict,
 } from "./decider.ts";
-import { type ContextLimits, namedFiles, readScripts } from "./transcript.ts";
+import { type ContextLimits, namedFiles, readScripts, TurnLog, type UserTurn } from "./transcript.ts";
 
 export interface ToolCallEvent {
   toolName: string;
@@ -54,7 +54,7 @@ export interface Engine {
   resolveRole(ctx: DeciderContext, roles: string[]): Model | undefined;
   classify(ctx: DeciderContext, model: Model, rules: Rule[], state: string, timeoutMs: number): Promise<ClassifyResult>;
   escalate(ctx: DeciderContext, model: Model, rules: Rule[], state: string, maxTokens: number, timeoutMs: number): Promise<Record<string, RuleVerdict> | undefined>;
-  conversationText(ctx: DeciderContext, pendingId: string | undefined, limits: ContextLimits): string | undefined;
+  conversationText(ctx: DeciderContext, pendingId: string | undefined, limits: ContextLimits, turns: UserTurn[]): string | undefined;
 }
 
 export const realEngine: Engine = {
@@ -383,17 +383,32 @@ async function onNoAnswer(config: Config, ctx: DeciderContext): Promise<BlockRes
 // The core decision for one tool call. Returns a block result, or undefined to let the call pass
 // on to omp's native approval.
 // `session` holds the calls the user allowed for this session (see sessionKey); createHandler owns
-// one per omp session.
-export async function decide(config: Config, engine: Engine, event: ToolCallEvent, ctx: DeciderContext, session: Set<string> = new Set()): Promise<BlockResult | undefined> {
+// one per omp session. `turns` are the user's messages, recorded as they were sent.
+export async function decide(
+  config: Config,
+  engine: Engine,
+  event: ToolCallEvent,
+  ctx: DeciderContext,
+  session: Set<string> = new Set(),
+  turns: UserTurn[] = [],
+): Promise<BlockResult | undefined> {
   const trace: Trace = { lines: [] };
   try {
-    return await decideTraced(config, engine, event, ctx, trace, session);
+    return await decideTraced(config, engine, event, ctx, trace, session, turns);
   } finally {
     emitSummary(config, ctx, trace);
   }
 }
 
-async function decideTraced(config: Config, engine: Engine, event: ToolCallEvent, ctx: DeciderContext, trace: Trace, session: Set<string>): Promise<BlockResult | undefined> {
+async function decideTraced(
+  config: Config,
+  engine: Engine,
+  event: ToolCallEvent,
+  ctx: DeciderContext,
+  trace: Trace,
+  session: Set<string>,
+  turns: UserTurn[],
+): Promise<BlockResult | undefined> {
   if (!config.enabled) {
     return undefined;
   }
@@ -423,10 +438,11 @@ async function decideTraced(config: Config, engine: Engine, event: ToolCallEvent
     trace.lines.push(["session", "ALLOW allowed earlier in this session"]);
     return undefined;
   }
-  const conversation = config.includeContext ? engine.conversationText(ctx, event.toolCallId, config.context) : undefined;
+  const conversation = config.includeContext ? engine.conversationText(ctx, event.toolCallId, config.context, turns) : undefined;
   const scripts = readScripts(subject, callCwd(tool, input, ctx), config.context.scriptChars);
   const state = renderState(tool, subject, conversation, scripts);
   emitDebug(config, trace, `checking ${tool} [${matching.map((r) => r.name).join(", ")}]: ${clip(subject)}`);
+  emitDebug(config, trace, `what the models see:\n${state}`);
 
   const useJudge = config.judgeRole !== "";
   const useLlm = config.llmRole !== "";
@@ -536,12 +552,13 @@ async function decideTraced(config: Config, engine: Engine, event: ToolCallEvent
   return act(config, ctx, decision, tool, subject, trace, allowForSession);
 }
 
-export function createHandler(config: Config, engine: Engine = realEngine) {
+// `turns` records the user's messages as they are sent (the plugin feeds it omp's `input` event).
+export function createHandler(config: Config, engine: Engine = realEngine, turns: TurnLog = new TurnLog()) {
   // Calls the user allowed for this session. In memory only: gone when omp exits.
   const sessionAllowed = new Set<string>();
   return async (event: ToolCallEvent, ctx: DeciderContext): Promise<BlockResult | undefined> => {
     try {
-      return await decide(config, engine, event, ctx, sessionAllowed);
+      return await decide(config, engine, event, ctx, sessionAllowed, turns.turns(ctx));
     } catch (error) {
       // A throwing tool_call handler fails closed in omp. Log it and apply the no-answer policy
       // instead, so an internal error honours the user's onNoAnswer choice rather than silently
@@ -603,7 +620,17 @@ export default function (pi: ExtensionAPI): void {
   if (loaded.error) {
     console.error(`[omp-warden] config ignored, using defaults: ${loaded.error}`);
   }
-  const handler = createHandler(loaded.config);
+  const turns = new TurnLog();
+  const handler = createHandler(loaded.config, realEngine, turns);
   const roles = hostRoleSettings(pi);
+  // omp sends `input` only for what the user typed or sent over RPC, before a skill is expanded.
+  // This only records it: returning nothing leaves the message as it is.
+  pi.on("input", (event, ctx) => {
+    const text = (event as { text?: unknown }).text;
+    if (typeof text === "string") {
+      turns.record(text, ctx as unknown as DeciderContext);
+    }
+    return undefined;
+  });
   pi.on("tool_call", (event, ctx) => handler(event as ToolCallEvent, withRoleSettings(ctx as unknown as DeciderContext, roles)));
 }

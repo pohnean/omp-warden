@@ -11,6 +11,8 @@
   "includeContext": true,
   "timeoutMs": 20000,
   "maxTokens": 512,
+  // What the models see (all optional; see README "What the models see").
+  // "context": { "maxChars": 6000, "recentCalls": 5, "askedChars": 400, "environment": ["prd/* cluster targets are production"] },
 
   // Every rule has the same shape; see config.example.yaml for what each field means.
   "rules": [
