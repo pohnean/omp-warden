@@ -6,7 +6,6 @@
 // of scalar settings the manifest exposes.
 
 import { existsSync, readFileSync } from "node:fs";
-import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 
@@ -81,7 +80,6 @@ export const CONFIG_DIR = path.join(AGENT_DIR, "omp-warden");
 // Config file basenames, in precedence order. A YAML file wins over JSON when both exist.
 const CONFIG_BASENAMES = ["config.yaml", "config.yml", "config.json"];
 
-const requireFrom = createRequire(import.meta.url);
 const PLUGIN_NAME = "omp-warden";
 const LOCK_FILE = path.join(HOME, ".omp/plugins/omp-plugins.lock.json");
 
@@ -323,12 +321,258 @@ export function validateConfig(raw: unknown): { config: Config; error?: string }
   return { config };
 }
 
-// Parses config text by extension: YAML for .yaml/.yml (via the `yaml` package, required lazily so
-// a JSON-only setup never needs it), JSON otherwise.
+// A small, dependency-free YAML parser for the config's subset: nested mappings, sequences of
+// scalars or mappings, inline flow sequences ([a, b]), quoted and plain scalars, numbers / bools /
+// null, "#" comments, and block scalars (">" folded, "|" literal). It throws on anything outside
+// this subset, so an unsupported file becomes a clean config error (defaults used) rather than a
+// silent mis-parse. Self-contained on purpose: omp's plugin runtime does not resolve a bundled
+// "yaml" dependency for a linked plugin.
+export function parseYaml(text: string): unknown {
+  const lines = text.split(/\r?\n/);
+  let i = 0;
+
+  const isBlank = (s: string): boolean => {
+    const t = s.trim();
+    return t === "" || t.startsWith("#");
+  };
+  const indentOf = (s: string): number => s.length - s.trimStart().length;
+
+  function stripComment(s: string): string {
+    const hash = s.indexOf(" #");
+    return (hash >= 0 ? s.slice(0, hash) : s).trim();
+  }
+
+  function coerce(v: string): unknown {
+    if (v === "" || v === "~" || v === "null") {
+      return null;
+    }
+    if (v === "true") {
+      return true;
+    }
+    if (v === "false") {
+      return false;
+    }
+    if (/^-?\d+(\.\d+)?$/.test(v)) {
+      return Number(v);
+    }
+    return v;
+  }
+
+  function quoted(s: string): string {
+    const q = s[0];
+    let out = "";
+    for (let j = 1; j < s.length; j += 1) {
+      const c = s[j];
+      if (q === '"' && c === "\\" && j + 1 < s.length) {
+        const n = s[j + 1];
+        out += n === "n" ? "\n" : n === "t" ? "\t" : n;
+        j += 1;
+        continue;
+      }
+      if (c === q) {
+        return out;
+      }
+      out += c;
+    }
+    throw new Error(`unterminated string: ${s}`);
+  }
+
+  // Splits on top-level commas (not inside quotes or nested brackets).
+  function splitTop(s: string): string[] {
+    const parts: string[] = [];
+    let depth = 0;
+    let quote = "";
+    let start = 0;
+    for (let j = 0; j < s.length; j += 1) {
+      const c = s[j];
+      if (quote) {
+        if (c === quote) {
+          quote = "";
+        }
+      } else if (c === '"' || c === "'") {
+        quote = c;
+      } else if (c === "[") {
+        depth += 1;
+      } else if (c === "]") {
+        depth -= 1;
+      } else if (c === "," && depth === 0) {
+        parts.push(s.slice(start, j));
+        start = j + 1;
+      }
+    }
+    parts.push(s.slice(start));
+    return parts.map((p) => p.trim()).filter((p) => p.length > 0);
+  }
+
+  function scalar(raw: string): unknown {
+    const s = raw.trim();
+    if (s.length === 0) {
+      return null;
+    }
+    if (s[0] === '"' || s[0] === "'") {
+      return quoted(s);
+    }
+    if (s[0] === "[") {
+      const end = s.lastIndexOf("]");
+      if (end < 0) {
+        throw new Error(`unterminated flow sequence: ${s}`);
+      }
+      const inner = s.slice(1, end).trim();
+      return inner === "" ? [] : splitTop(inner).map((item) => scalar(item));
+    }
+    if (s[0] === "{") {
+      throw new Error("flow mappings are not supported");
+    }
+    return coerce(stripComment(s));
+  }
+
+  function blockScalar(marker: string, parentIndent: number): string {
+    const fold = marker[0] === ">";
+    const collected: string[] = [];
+    let blockIndent = -1;
+    while (i < lines.length) {
+      const line = lines[i];
+      if (line.trim() === "") {
+        collected.push("");
+        i += 1;
+        continue;
+      }
+      const ind = indentOf(line);
+      if (ind <= parentIndent) {
+        break;
+      }
+      if (blockIndent < 0) {
+        blockIndent = ind;
+      }
+      collected.push(line.slice(blockIndent));
+      i += 1;
+    }
+    while (collected.length > 0 && collected[collected.length - 1] === "") {
+      collected.pop();
+    }
+    return fold ? collected.join(" ").replace(/\s+/g, " ").trim() : collected.join("\n");
+  }
+
+  function value(rest: string, parentIndent: number): unknown {
+    const trimmed = rest.trim();
+    if (/^[>|][+-]?$/.test(trimmed)) {
+      return blockScalar(trimmed, parentIndent);
+    }
+    if (trimmed === "") {
+      return block(parentIndent + 1);
+    }
+    return scalar(trimmed);
+  }
+
+  function colonAt(s: string): number {
+    let quote = "";
+    for (let j = 0; j < s.length; j += 1) {
+      const c = s[j];
+      if (quote) {
+        if (c === quote) {
+          quote = "";
+        }
+      } else if (c === '"' || c === "'") {
+        quote = c;
+      } else if (c === ":" && (j + 1 >= s.length || s[j + 1] === " ")) {
+        return j;
+      }
+    }
+    return -1;
+  }
+
+  function mapping(indent: number): Record<string, unknown> {
+    const obj: Record<string, unknown> = {};
+    while (i < lines.length) {
+      if (isBlank(lines[i])) {
+        i += 1;
+        continue;
+      }
+      const ind = indentOf(lines[i]);
+      if (ind < indent) {
+        break;
+      }
+      if (ind > indent) {
+        throw new Error(`unexpected indent at: ${lines[i].trim()}`);
+      }
+      const content = lines[i].slice(indent);
+      const colon = colonAt(content);
+      if (colon < 0) {
+        throw new Error(`expected 'key:' at: ${content}`);
+      }
+      const key = content.slice(0, colon).trim();
+      const rest = content.slice(colon + 1);
+      i += 1;
+      obj[key] = value(rest, indent);
+    }
+    return obj;
+  }
+
+  function sequence(indent: number): unknown[] {
+    const arr: unknown[] = [];
+    while (i < lines.length) {
+      if (isBlank(lines[i])) {
+        i += 1;
+        continue;
+      }
+      const ind = indentOf(lines[i]);
+      if (ind < indent) {
+        break;
+      }
+      if (ind > indent) {
+        throw new Error(`unexpected indent in sequence at: ${lines[i].trim()}`);
+      }
+      const content = lines[i].slice(indent);
+      if (content[0] !== "-") {
+        break;
+      }
+      const after = content.slice(1).trimStart();
+      if (after === "") {
+        i += 1;
+        arr.push(block(indent + 1));
+        continue;
+      }
+      if (colonAt(after) >= 0) {
+        // "- key: value" starts a mapping item; re-read it at the key's column.
+        const keyIndent = indent + (content.length - after.length);
+        lines[i] = " ".repeat(keyIndent) + after;
+        arr.push(mapping(keyIndent));
+        continue;
+      }
+      i += 1;
+      arr.push(scalar(after));
+    }
+    return arr;
+  }
+
+  // Parses a mapping or sequence whose items are indented at least `minIndent`.
+  function block(minIndent: number): unknown {
+    while (i < lines.length && isBlank(lines[i])) {
+      i += 1;
+    }
+    if (i >= lines.length) {
+      return null;
+    }
+    const indent = indentOf(lines[i]);
+    if (indent < minIndent) {
+      return null;
+    }
+    return lines[i].slice(indent).startsWith("-") ? sequence(indent) : mapping(indent);
+  }
+
+  while (i < lines.length && isBlank(lines[i])) {
+    i += 1;
+  }
+  if (i >= lines.length) {
+    return {};
+  }
+  return block(indentOf(lines[i]));
+}
+
+// Parses config text by extension: the small built-in YAML parser for .yaml/.yml, JSON otherwise.
 function parseConfigText(file: string, text: string): unknown {
   if (file.endsWith(".yaml") || file.endsWith(".yml")) {
-    const yaml = requireFrom("yaml") as { parse(text: string): unknown };
-    return yaml.parse(text);
+    return parseYaml(text);
   }
   return JSON.parse(text);
 }

@@ -32,7 +32,12 @@
       "debug": {
         "type": "boolean",
         "default": false,
-        "description": "Print a line to chat for each call checked, including the classifier's score."
+        "description": "Print a line to chat for each call checked, including each rule's score and the verdict."
+      },
+      "includeContext": {
+        "type": "boolean",
+        "default": true,
+        "description": "Send the conversation to the judge so already-authorized calls aren't re-asked."
       },
       "judgeRole": {
         "type": "string",
@@ -55,8 +60,5 @@
         "description": "What a stage that should answer but cannot falls back to (model down, timeout, or not a judge)."
       }
     }
-  },
-  "dependencies": {
-    "yaml": "^2.9.1"
   }
 }

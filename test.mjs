@@ -10,7 +10,7 @@ import path from "node:path";
 
 import { createHandler, decide, describe as describeCall, matchesTool, matchingRules, renderState } from "./index.ts";
 import { parseEscalation, readRuleRisk, resolveRole, resolveRoleModel } from "./decider.ts";
-import { DEFAULTS, loadConfig, validateConfig } from "./config.ts";
+import { DEFAULTS, loadConfig, parseYaml, validateConfig } from "./config.ts";
 
 function cfg(overrides = {}) {
   return { ...structuredClone(DEFAULTS), ...overrides };
@@ -224,6 +224,36 @@ test("resolveRole / resolveRoleModel", () => {
   assert.equal(resolveRole(ctx, ["smol", "default"]).id, "d"); // smol unset -> default
   const none = { modelRegistry: reg, model: { id: "session" }, settings: { getModelRole: () => undefined } };
   assert.equal(resolveRole(none, ["smol", "default"]).id, "session"); // falls back to session model
+});
+
+test("parseYaml handles the config subset (comments, flow arrays, folded scalars, numbers/bools)", () => {
+  const y = [
+    "enabled: true",
+    "judgeRole: judge        # trailing comment",
+    "rules:",
+    "  - name: auto-mode",
+    '    tools: ["*"]',
+    "    type: choice",
+    "    allowBelow: 0.1",
+    "    askAbove: 0.2",
+    "  - name: exfil",
+    "    tools: [bash, web_fetch]",
+    "    question: >",
+    "      line one",
+    "      line two",
+    "    askAbove: 0.3",
+    "",
+  ].join("\n");
+  const o = parseYaml(y);
+  assert.equal(o.enabled, true);
+  assert.equal(o.judgeRole, "judge");
+  assert.equal(o.rules.length, 2);
+  assert.deepEqual(o.rules[0].tools, ["*"]);
+  assert.equal(o.rules[0].type, "choice");
+  assert.equal(o.rules[0].allowBelow, 0.1);
+  assert.deepEqual(o.rules[1].tools, ["bash", "web_fetch"]);
+  assert.equal(o.rules[1].question, "line one line two");
+  assert.equal(o.rules[1].askAbove, 0.3);
 });
 
 test("loadConfig reads a YAML file and defaults the rest", () => {
