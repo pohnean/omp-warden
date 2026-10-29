@@ -43,7 +43,12 @@ export interface DeciderContext {
   hasUI?: boolean;
   sessionManager?: { getBranch?(): unknown };
   // omp's dialog takes a title and a body: confirm(title, message, options).
-  ui?: { confirm?(title: string, message: string): Promise<boolean>; notify?(message: string, level?: string): void };
+  cwd?: string;
+  ui?: {
+    confirm?(title: string, message: string): Promise<boolean>;
+    select?(title: string, options: string[], opts?: { signal?: AbortSignal }): Promise<string | undefined>;
+    notify?(message: string, level?: string): void;
+  };
 }
 
 interface PiAi {

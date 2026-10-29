@@ -13,7 +13,8 @@
 // The hook only ever blocks or asks (never force-allows), so it composes with omp's approval mode.
 // Run it under `approvalMode: yolo` for a permissive default.
 
-import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { appendFileSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { AGENT_DIR, CONFIG_DIR, loadConfig, parseYaml, type Config, type Rule } from "./config.ts";
@@ -86,6 +87,46 @@ export function describe(tool: string, input: Record<string, unknown>): string {
     return input.command;
   }
   return `${tool} ${JSON.stringify(input ?? {})}`;
+}
+
+// The working directory of a call: the session's, or a bash call's own `cwd` resolved against it.
+function callCwd(tool: string, input: Record<string, unknown>, ctx: DeciderContext): string {
+  const base = ctx.cwd ?? process.cwd();
+  if (tool === "bash" && typeof input.cwd === "string" && input.cwd !== "") {
+    return path.resolve(base, input.cwd);
+  }
+  return base;
+}
+
+// A hash of every word in the command that is an existing file (e.g. `bash backup.sh`), so an
+// edited script no longer matches a call allowed for the session. Empty when it names no file.
+export function scriptHash(subject: string, cwd: string): string {
+  const hash = createHash("sha256");
+  let found = false;
+  for (const word of new Set(subject.split(/[\s;|&()<>'"`]+/))) {
+    if (word === "") {
+      continue;
+    }
+    const file = path.resolve(cwd, word);
+    try {
+      if (!statSync(file).isFile()) {
+        continue;
+      }
+      hash.update(file).update("\0").update(readFileSync(file)).update("\0");
+      found = true;
+    } catch {
+      // Not a file.
+    }
+  }
+  return found ? hash.digest("hex").slice(0, 16) : "";
+}
+
+// What "Allow for this session" remembers: this exact call — tool, folder, command text and the
+// contents of any script it names. Any difference asks again.
+export function sessionKey(tool: string, input: Record<string, unknown>, ctx: DeciderContext): string {
+  const cwd = callCwd(tool, input, ctx);
+  const subject = describe(tool, input);
+  return [tool, cwd, subject, scriptHash(subject, cwd)].join("\0");
 }
 
 // The `state` string the judge and the llm both see: the conversation (when includeContext) plus
@@ -238,7 +279,37 @@ async function confirmWithUser(ctx: DeciderContext, title: string, message: stri
 
 // Acts on a finding: a block stops the call; an ask prompts the user (or stops the call when there is
 // no UI — a subagent can't answer). The rule's description is the title; reason and score are shown.
-async function act(config: Config, ctx: DeciderContext, finding: Finding, tool: string, subject: string, trace: Trace): Promise<BlockResult | undefined> {
+const ALLOW_ONCE = "Allow once";
+const ALLOW_SESSION = "Allow for this session";
+const BLOCK = "Block";
+
+type Choice = "once" | "session" | "block";
+
+// The ask dialog: Allow once / Allow for this session / Block where omp has a select dialog, else a
+// yes/no confirm (no session option). No UI, a cancel or an error is a block.
+async function askUser(ctx: DeciderContext, title: string, message: string): Promise<Choice> {
+  if (!ctx.hasUI) {
+    return "block";
+  }
+  if (typeof ctx.ui?.select === "function") {
+    try {
+      const picked = await ctx.ui.select(`${title}\n\n${message}`, [ALLOW_ONCE, ALLOW_SESSION, BLOCK], { signal: ctx.signal });
+      if (picked === ALLOW_ONCE) {
+        return "once";
+      }
+      if (picked === ALLOW_SESSION) {
+        return "session";
+      }
+      return "block";
+    } catch {
+      return "block";
+    }
+  }
+  const approved = await confirmWithUser(ctx, title, `${message}\n\nRun it anyway?`);
+  return approved ? "once" : "block";
+}
+
+async function act(config: Config, ctx: DeciderContext, finding: Finding, tool: string, subject: string, trace: Trace, onSession: () => void): Promise<BlockResult | undefined> {
   const label = finding.rule.description;
   const scores = scoreLine(finding);
   emitDebug(config, ctx, `${finding.verdict} — ${finding.rule.name}: ${finding.reason} (${scores})`);
@@ -246,10 +317,14 @@ async function act(config: Config, ctx: DeciderContext, finding: Finding, tool: 
     trace.outcome = `block ${finding.rule.name}`;
     return { block: true, reason: `omp-warden blocked this call — ${label}: ${finding.reason} (${scores}). ${ASK_LINE}` };
   }
-  const message = `${finding.reason}\n\n${tool}: ${clip(subject, 300)}\n\nRun it anyway?`;
-  const approved = await confirmWithUser(ctx, `omp-warden: ${label}`, message);
-  trace.outcome = `ask ${finding.rule.name} → ${approved ? "approved" : ctx.hasUI ? "declined" : "blocked (no UI)"}`;
-  if (approved) {
+  const message = `${finding.reason}\n\n${tool}: ${clip(subject, 300)}`;
+  const choice = await askUser(ctx, `omp-warden: ${label}`, message);
+  if (choice === "session") {
+    onSession();
+  }
+  const answered = choice === "block" ? (ctx.hasUI ? "declined" : "blocked (no UI)") : choice;
+  trace.outcome = `ask ${finding.rule.name} → ${answered}`;
+  if (choice !== "block") {
     return undefined;
   }
   return { block: true, reason: `omp-warden needs your approval — ${label}: ${finding.reason} (${scores}). ${ASK_LINE}` };
@@ -281,16 +356,18 @@ async function onNoAnswer(config: Config, ctx: DeciderContext, trace?: Trace): P
 
 // The core decision for one tool call. Returns a block result, or undefined to let the call pass
 // on to omp's native approval.
-export async function decide(config: Config, engine: Engine, event: ToolCallEvent, ctx: DeciderContext): Promise<BlockResult | undefined> {
+// `session` holds the calls the user allowed for this session (see sessionKey); createHandler owns
+// one per omp session.
+export async function decide(config: Config, engine: Engine, event: ToolCallEvent, ctx: DeciderContext, session: Set<string> = new Set()): Promise<BlockResult | undefined> {
   const trace: Trace = { started: Date.now(), head: "", parts: new Map() };
   try {
-    return await decideTraced(config, engine, event, ctx, trace);
+    return await decideTraced(config, engine, event, ctx, trace, session);
   } finally {
     emitSummary(config, ctx, trace);
   }
 }
 
-async function decideTraced(config: Config, engine: Engine, event: ToolCallEvent, ctx: DeciderContext, trace: Trace): Promise<BlockResult | undefined> {
+async function decideTraced(config: Config, engine: Engine, event: ToolCallEvent, ctx: DeciderContext, trace: Trace, session: Set<string>): Promise<BlockResult | undefined> {
   if (!config.enabled) {
     return undefined;
   }
@@ -307,6 +384,15 @@ async function decideTraced(config: Config, engine: Engine, event: ToolCallEvent
 
   const input = (event.input ?? {}) as Record<string, unknown>;
   const subject = describe(tool, input);
+  const key = sessionKey(tool, input, ctx);
+  const allowForSession = () => {
+    session.add(key);
+  };
+  if (session.has(key)) {
+    trace.head = `${tool}: ${clip(subject, 60)}`;
+    trace.outcome = "allow (session)";
+    return undefined;
+  }
   const conversation = config.includeContext ? engine.conversationText(ctx) : undefined;
   const state = renderState(tool, subject, conversation);
   emitDebug(config, ctx, `checking ${tool} [${matching.map((r) => r.name).join(", ")}]: ${clip(subject)}`);
@@ -359,7 +445,7 @@ async function decideTraced(config: Config, engine: Engine, event: ToolCallEvent
           worst === "block"
             ? `The classifier is confident this must not run (P(block) at or above ${top.rule.blockAbove}).`
             : `The classifier rates this risky enough to need your approval (risk at or above ${top.rule.askAbove}).`;
-        return act(config, ctx, { rule: top.rule, verdict: worst, reason, score: top.score, by: "classifier" }, tool, subject, trace);
+        return act(config, ctx, { rule: top.rule, verdict: worst, reason, score: top.score, by: "classifier" }, tool, subject, trace, allowForSession);
       }
       // worst === "escalate"
       unsure = banded.filter((entry) => entry.band === "escalate").map((entry) => entry.rule);
@@ -416,13 +502,15 @@ async function decideTraced(config: Config, engine: Engine, event: ToolCallEvent
     trace.outcome = "allow (llm)";
     return undefined;
   }
-  return act(config, ctx, decision, tool, subject, trace);
+  return act(config, ctx, decision, tool, subject, trace, allowForSession);
 }
 
 export function createHandler(config: Config, engine: Engine = realEngine) {
+  // Calls the user allowed for this session. In memory only: gone when omp exits.
+  const sessionAllowed = new Set<string>();
   return async (event: ToolCallEvent, ctx: DeciderContext): Promise<BlockResult | undefined> => {
     try {
-      return await decide(config, engine, event, ctx);
+      return await decide(config, engine, event, ctx, sessionAllowed);
     } catch (error) {
       // A throwing tool_call handler fails closed in omp. Log it and apply the no-answer policy
       // instead, so an internal error honours the user's onNoAnswer choice rather than silently
