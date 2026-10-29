@@ -1,69 +1,44 @@
-// Every key of the live config, with its default. Everything is optional — omit a key to use its
-// default. The live config file is plain JSON at:
+// omp-warden config (JSON). The live file is plain JSON at:
 //   $PI_CODING_AGENT_DIR/omp-warden/config.json   (default ~/.omp/agent/omp-warden/config.json)
-// Drop these comments and keep only the keys you change. A config with any error is ignored as a
-// whole (the defaults are used), so a single typo can never half-apply.
-//
-// The scalar keys (enabled, debug, judgeRole, llmRole, onNoAnswer) can also be set through
-// `omp /settings` -> Plugins -> omp-warden, or `omp plugin config`; those override this file.
-// The arrays (whitelist, rules) are file-only.
+// A YAML file (config.yaml) is also supported and is nicer for multi-line questions — see
+// config.example.yaml. Everything is optional; drop these comments for real JSON. A config with
+// any error is ignored as a whole (defaults used), so a typo can't half-apply.
 {
-  // Turn the gate on or off. When off, omp's native approval decides alone.
   "enabled": true,
-
-  // Print a line to chat for each call checked, including the classifier's score. Handy while
-  // tuning thresholds or seeing what the classifier decided.
   "debug": false,
 
-  // The two stages are independent. Set a role to a model role, or to null to turn that stage off:
-  //   both set        -> classifier, then the llm for the uncertain middle band
-  //   judgeRole only  -> classifier only (block above blockAbove, otherwise run)
-  //   llmRole only    -> the llm judges every in-scope call
-  //   both null       -> nothing scored; native approval decides
+  // Models are chosen by omp model role; set a role to null to disable that stage.
+  "judgeRole": "judge",     // stage 1 classifier (a native judge)
+  "llmRole": "smol",        // stage 2 for the unsure band; falls back to the "default" role
 
-  // Stage 1: the omp model role that scores risk. Point it at a local native judge, e.g.
-  //   modelRoles:
-  //     judge: local/lfm2-1.2b
-  // Use null to disable the classifier stage.
-  "judgeRole": "judge",
-
-  // Stage 2: the omp model role whose chat model decides. Falls back to the "default" role when
-  // this one is unset in omp. Use null to disable the llm stage.
-  "llmRole": "smol",
-
-  // What a stage that should answer but cannot falls back to (model down, timeout, not a judge):
-  // "block" (default), "ask" (prompt if there is a UI), or "allow".
-  "onNoAnswer": "block",
-
-  // Per-model-call timeout, in milliseconds.
+  "onNoAnswer": "block",    // judge can't answer: "block" | "ask" | "allow"
+  "includeContext": true,   // send the conversation so already-authorized calls aren't re-asked
   "timeoutMs": 20000,
-
-  // Reply budget for the stage-2 chat model.
   "maxTokens": 512,
 
-  // Optional. Tools that are never scored (native omp approval still applies). Omit to use the
-  // built-in default: read, grep, glob, find, ast_grep, lsp, todo, ask, task, think, wait, yield.
-  // "whitelist": ["read", "grep", "glob"],
-
-  // Rules are tried in order; the first whose `tools` match the call decides it. A call matching
-  // no rule is left entirely to native approval.
+  // Every matching rule is scored in one request; worst verdict wins. Per rule, by risk:
+  //   < allowBelow run; [allowBelow, askAbove) unsure -> llm; >= askAbove ask; > blockAbove block.
   "rules": [
     {
-      "name": "default",
-
-      // Tool-name patterns: "*" matches every tool, "prefix*" matches by prefix, or an exact name.
+      "name": "auto-mode",
+      "description": "General safety check",
       "tools": ["*"],
-
-      // Risk in [0, 1]: risk < allowBelow runs; risk > blockAbove is blocked; a risk between the
-      // two goes to the stage-2 chat model (or just runs, when there is no llm stage).
-      "allowBelow": 0.2,
-      "blockAbove": 0.8,
-
-      // The yes/no question the stage-1 judge answers about the call.
-      "question": "Could this tool call exfiltrate data, change a production system, or destroy data that the user did not explicitly ask to change?",
-
-      // Whether stage 1 also sees a transcript of the conversation, not just the command.
-      "includeContext": true
+      "type": "choice",      // allow/ask/block (risk = 1 - P(allow)); built-in policy unless overridden
+      "allowBelow": 0.1,
+      "askAbove": 0.2
+      // "blockAbove" omitted -> ask-only
+    },
+    {
+      "name": "data-exfiltration",
+      "description": "Sending data to an untrusted destination",
+      "tools": ["bash", "web_fetch", "fetch", "http"],
+      "type": "noul",        // yes/no hazard (risk = P(yes)); inferred when "question" is present
+      "question": "Does this send code, data, logs, env vars or files to a third party, an unknown host, a paste/share site, or a public destination?",
+      "yes": "Data leaves the user's trusted systems.",
+      "no": "Nothing leaves the user's trusted systems.",
+      "allowBelow": 0.1,
+      "askAbove": 0.3,
+      "blockAbove": 0.8
     }
   ]
 }

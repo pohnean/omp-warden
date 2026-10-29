@@ -19,26 +19,30 @@ omp already does the deterministic work natively, so this plugin does **not** re
 | Subagent / no-UI handling | native headless-yolo (a prompt auto-rejects) |
 
 This plugin is purely the **classifier gate**. Its `tool_call` hook runs *before* native approval
-and only ever **blocks** (or lets the call fall through to native approval), so it composes with
-whatever mode omp is in. Run omp in `yolo` for the intended "permissive by default, catch the
-dangerous stuff" behaviour.
+and only ever **blocks or asks** (otherwise the call falls through to native approval), so it
+composes with whatever mode omp is in. Run omp in `yolo` for the intended "permissive by default,
+catch the dangerous stuff" behaviour.
 
 ## How a call is decided
 
-For each tool call that isn't on the whitelist and matches a rule:
+For a tool call that isn't on the whitelist, **every rule whose `tools` match is scored in one
+request**, and the worst verdict wins — the tripped rule's `description` is the reason shown.
 
-1. **Stage 1 — classifier.** The model on the omp `judge` role scores the call's risk in `[0, 1]`
-   (a native judge; a local tiny model works).
-   - `risk < rule.allowBelow` → **allow** (falls through to native approval).
-   - `risk > rule.blockAbove` → **block**.
-   - in between → stage 2.
-2. **Stage 2 — chat fallback.** The model on the omp `llm` role (default: the `default` role —
-   your session model) decides `ALLOW` / `BLOCK` with a short reason. This also runs when stage 1
-   can't score (the role model isn't a native judge, is down, or times out).
-3. If neither stage answers, `onNoAnswer` decides (`block` by default).
+1. **Stage 1 — classifier.** The model on the omp `judge` role scores each rule's risk in `[0, 1]`
+   (a native judge; a local tiny model works). Per rule:
+   - `risk < allowBelow` → **run**.
+   - `allowBelow ≤ risk < askAbove` → **unsure** → stage 2 (or run, if the llm stage is off).
+   - `askAbove ≤ risk` → **ask** the user.
+   - `risk > blockAbove` (optional) → **block** outright.
+2. **Stage 2 — llm.** When a rule is unsure, the model on the omp `llm` role (default `smol`,
+   falling back to `default`) gives a 3-way `ALLOW` / `ASK` / `BLOCK` for the whole call — reading
+   the full command/script and the conversation. It also runs when the classifier can't score.
+3. If neither stage answers, `onNoAnswer` decides (`block` by default). Without a UI an `ask`
+   blocks — a subagent can't be prompted.
 
-The score is **risk** — higher means riskier. Each rule carries its own `allowBelow` / `blockAbove`
-thresholds, so you tune how eager the gate is per rule.
+Higher risk = riskier. A rule is either a broad **`choice`** judgment (allow/ask/block — the
+`auto-mode` default) or a specific **`noul`** hazard (yes/no). Set `judgeRole`/`llmRole` to `null`
+to run classifier-only, llm-only, or (both `null`) leave everything to native omp.
 
 ## Install
 
@@ -84,14 +88,15 @@ handy for multi-line `question` strings. Everything is optional — omit a key f
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `true` | Turn the gate off and let native approval decide alone. |
-| `debug` | `false` | Print each checked call and the classifier's score to chat. |
+| `debug` | `false` | Print each checked call, its rule scores and the verdict to chat. |
+| `includeContext` | `true` | Send the conversation so already-authorized calls aren't re-asked. |
 | `whitelist` | reads, search, todo, task, … | Tools never scored (native approval still applies). Omit for the built-in list. |
 | `judgeRole` | `"judge"` | Stage-1 classifier model role. `null` disables the classifier stage. |
-| `llmRole` | `"smol"` | Stage-2 chat model role; falls back to `default`. `null` disables the llm stage. |
-| `onNoAnswer` | `"block"` | When a stage can't answer: `block` \| `ask` \| `allow`. |
-| `timeoutMs` | `20000` | Per-model-call timeout. |
-| `maxTokens` | `512` | Reply budget for the stage-2 chat model. |
-| `rules[]` | one `*` rule | `name`, `tools[]`, `allowBelow`, `blockAbove`, `question`, `includeContext` (all but a question optional). |
+| `llmRole` | `"smol"` | Stage-2 model role; falls back to `default`. `null` disables the llm stage. |
+| `onNoAnswer` | `"block"` | When the judge can't answer: `block` \| `ask` \| `allow`. |
+| `timeoutMs` | `20000` | Per-request timeout. |
+| `maxTokens` | `512` | Reply budget for the llm stage. |
+| `rules[]` | one `auto-mode` rule | See [Rules](#rules). |
 
 Set `judgeRole`/`llmRole` to `null` to run **classifier-only**, **llm-only**, or (both `null`)
 leave every in-scope call to native approval. A config with any error is ignored as a whole (the
@@ -99,28 +104,43 @@ defaults are used), so a typo can't half-apply.
 
 ### `/settings`
 
-The scalar keys (`enabled`, `judgeRole`, `llmRole`, `onNoAnswer`) are declared in the plugin
-manifest, so they appear under `omp /settings → Plugins → omp-warden` and `omp plugin config`.
-Because omp doesn't feed plugin settings to a running extension, the plugin reads those values back
-from the plugin lock file (`~/.omp/plugins/omp-plugins.lock.json`) and project
-`.omp/plugin-overrides.json`, and they override the config file. The arrays (`whitelist`, `rules`)
+The scalar keys (`enabled`, `debug`, `includeContext`, `judgeRole`, `llmRole`, `onNoAnswer`) are
+declared in the plugin manifest, so they appear under `omp /settings → Plugins → omp-warden` and
+`omp plugin config`. Because omp doesn't feed plugin settings to a running extension, the plugin
+reads those values back from the plugin lock file (`~/.omp/plugins/omp-plugins.lock.json`) and
+project `.omp/plugin-overrides.json`, and they override the config file. `whitelist` and `rules`
 are file-only.
 
 ## Rules
 
-Rules are tried in order; the first whose `tools` match the call decides it. A call matching no rule
-is left entirely to native approval.
+Every rule whose `tools` match a call is evaluated together (one request); the **worst verdict
+wins** and the tripped rule's `description` is shown. A call matching no rule is left to native
+approval. A rule is a broad **`choice`** judgment or a specific **`noul`** hazard:
 
-```jsonc
-{
-  "name": "network",
-  "tools": ["bash", "web*"],   // "*" = all, "prefix*" = by prefix, or an exact tool name
-  "allowBelow": 0.15,          // stricter than the default: escalate sooner
-  "blockAbove": 0.6,
-  "question": "Does this send data to a remote host or change a production system?",
-  "includeContext": true        // stage 1 also sees a transcript of the conversation
-}
+```yaml
+rules:
+  - name: auto-mode                 # the built-in default — you get this with no rules at all
+    description: General safety check
+    tools: ["*"]
+    type: choice                    # allow/ask/block; risk = 1 - P(allow)
+    allowBelow: 0.1
+    askAbove: 0.2                   # blockAbove omitted -> ask-only
+
+  - name: data-exfiltration         # a sharper overlay that can hard-block
+    description: Sending data to an untrusted destination
+    tools: [bash, web_fetch, fetch, http]
+    question: "Does this send data to a third party or public destination?"   # a `question` makes it a noul
+    yes: "Data leaves the user's trusted systems."
+    no: "Nothing leaves."
+    allowBelow: 0.1
+    askAbove: 0.3
+    blockAbove: 0.8
 ```
+
+Fields: `name`, `description` (shown on ask/block), `tools` (`"*"`, `"prefix*"`, or exact),
+`type` (`choice` | `noul` — inferred `noul` when a `question` is set), `allowBelow` + `askAbove`
+(+ optional `blockAbove`); a `noul` takes `question`/`yes`/`no`, a `choice` takes
+`instructions`/`criteria` (built-in policy if omitted).
 
 ## Development
 

@@ -1,47 +1,56 @@
-# omp-warden config (YAML). Save as one of, in precedence order:
-#   $PI_CODING_AGENT_DIR/omp-warden/config.yaml   (default ~/.omp/agent/omp-warden/config.yaml)
-#   config.yml, or config.json
-# Everything is optional — omit a key to use its default. A config with any error is ignored as a
-# whole (the defaults are used), so a single typo can never half-apply. The scalar keys can also be
-# set via `omp /settings` -> Plugins -> omp-warden (those override this file); the lists are
-# file-only.
+# omp-warden config (YAML). Save as config.yaml / config.yml / config.json in:
+#   $PI_CODING_AGENT_DIR/omp-warden/   (default ~/.omp/agent/omp-warden/)
+# Everything is optional — omit a key for its default. A config with any error is ignored as a
+# whole (defaults used), so a typo can't half-apply. The scalars (enabled, debug, judgeRole,
+# llmRole, onNoAnswer, includeContext) are also settable via `omp /settings`; rules are file-only.
 
-# Turn the gate on or off. When off, omp's native approval decides alone.
 enabled: true
+debug: false            # print each checked call, its rule scores and the verdict to chat
 
-# Print a line to chat for each call checked, including the classifier's score.
-debug: false
+# Models are chosen by omp model role. Set a role to null to disable that stage.
+judgeRole: judge        # stage 1 classifier — a native judge (e.g. modelRoles.judge: local/lfm2-1.2b)
+llmRole: smol           # stage 2 for the unsure band; falls back to the "default" role when unset
 
-# The two stages are independent. Set a role, or null to turn that stage off:
-#   both set        -> classifier, then the llm for the uncertain middle band
-#   judgeRole only  -> classifier only (block above blockAbove, otherwise run)
-#   llmRole only    -> the llm judges every in-scope call
-#   both null       -> nothing scored; native approval decides
-judgeRole: judge   # stage 1: a native judge model role (e.g. modelRoles.judge: local/lfm2-1.2b)
-llmRole: smol      # stage 2: a chat model role; falls back to the "default" role when unset
-
-# What a stage that should answer but cannot falls back to: block | ask | allow
-onNoAnswer: block
-
-# Per-model-call timeout (ms) and the stage-2 reply budget.
+onNoAnswer: block       # when the judge can't answer (down/timeout): block | ask | allow
+includeContext: true    # send the conversation so already-authorized calls aren't re-asked
 timeoutMs: 20000
 maxTokens: 512
 
-# Optional. Tools never scored (native approval still applies). Omit to use the built-in default:
-# read, grep, glob, find, ast_grep, lsp, todo, ask, task, think, wait, yield.
-# whitelist: [read, grep, glob]
-
-# Rules are tried in order; the first whose `tools` match the call decides it. A rule can be just a
-# name + question — tools default to ["*"], allowBelow to 0.2, blockAbove to 0.8, includeContext to true.
+# Every rule whose `tools` match a call is scored in one request; the worst verdict wins and the
+# tripped rule's `description` is shown. Per rule, by the classifier's risk:
+#   risk < allowBelow             -> run
+#   allowBelow <= risk < askAbove -> unsure -> the llm decides (or run, if the llm stage is off)
+#   askAbove <= risk              -> ask the user
+#   risk > blockAbove (optional)  -> block outright
 rules:
-  - name: default
-    # "*" matches every tool, "prefix*" matches by prefix, or an exact tool name.
+  # The general "auto-mode" gate: a broad allow/ask/block judgment over every tool. This is the
+  # built-in default — you get exactly this rule with no `rules:` block at all.
+  - name: auto-mode
+    description: General safety check
     tools: ["*"]
-    # Risk in [0, 1]: < allowBelow runs; > blockAbove is blocked; in between goes to the llm stage
-    # (or just runs, when there is no llm stage).
-    allowBelow: 0.2
+    type: choice          # allow/ask/block decision (risk = 1 - P(allow))
+    allowBelow: 0.1
+    askAbove: 0.2
+    # blockAbove omitted -> ask-only (never auto-blocks)
+    # instructions / criteria: omit to use the built-in allow/ask/block policy, or set to override
+
+  # Optional sharper overlays: specific hazards that can hard-block and give a precise reason.
+  - name: data-exfiltration
+    description: Sending data to an untrusted destination
+    tools: [bash, web_fetch, fetch, http]
+    type: noul            # a yes/no hazard (risk = P(yes)); inferred when `question` is present
+    question: "Does this send code, data, logs, env vars or files to a third party, an unknown host, a paste/share site, or a public destination?"
+    yes: "Data leaves the user's trusted systems."
+    no: "Nothing leaves the user's trusted systems."
+    allowBelow: 0.1
+    askAbove: 0.3
     blockAbove: 0.8
-    includeContext: true
-    question: >
-      Could this tool call exfiltrate data, change a production system, or destroy data
-      that the user did not explicitly ask to change?
+
+  - name: modifies-production
+    description: Changing a production system
+    tools: [bash]
+    question: "Does this change, delete, deploy to, restart or migrate a production system?"
+    yes: "It changes the state of production."
+    no: "It does not touch production."
+    askAbove: 0.5
+    # blockAbove omitted -> this hazard only asks
