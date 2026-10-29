@@ -474,8 +474,8 @@ async function decideTraced(config: Config, engine: Engine, event: ToolCallEvent
         const top = candidates.reduce((best, entry) => (key(entry) > key(best) ? entry : best));
         const reason =
           worst === "block"
-            ? `The classifier is confident this must not run (P(block) at or above ${top.rule.blockAbove}).`
-            : `The classifier rates this risky enough to need your approval (risk at or above ${top.rule.askAbove}).`;
+            ? `The classifier is confident this must not run (P(block) ${top.score?.pBlock?.toFixed(2)}, at or above ${top.rule.blockAbove}).`
+            : `The classifier rates this risky enough to need your approval (risk ${top.score?.risk.toFixed(2)}, at or above ${top.rule.askAbove}).`;
         return act(config, ctx, { rule: top.rule, verdict: worst, reason, score: top.score, by: "classifier" }, tool, subject, trace, allowForSession);
       }
       // worst === "escalate"

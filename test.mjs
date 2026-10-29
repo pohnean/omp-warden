@@ -276,14 +276,14 @@ test("an llm block only blocks on a rule with blockAbove; otherwise it asks", as
   assert.match(r2.reason, /needs your approval — General safety check: secrets out/);
 });
 
-test("the ask dialog has a title and a body with the reason and the command, no scores", async () => {
+test("the ask dialog has a title and a body with the reason, its risk and the command, no score line", async () => {
   let title;
   let message;
   const ctx = { hasUI: true, ui: { confirm: async (t, m) => { title = t; message = m; return true; } } };
   const { engine } = makeEngine({ scores: auto(0.6, 0.1) });
   assert.equal(await decide(cfg(), engine, bash("kubectl delete ns prod"), ctx), undefined);
   assert.equal(title, "omp-warden: General safety check");
-  assert.match(message, /risky enough to need your approval/);
+  assert.match(message, /risky enough to need your approval \(risk 0\.60, at or above 0\.2\)/);
   assert.doesNotMatch(message, /P\(block\)|asks at/);
   assert.match(message, /bash: kubectl delete ns prod/);
   assert.doesNotMatch(`${title}${message}`, /undefined/);
