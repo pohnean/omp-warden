@@ -5,7 +5,8 @@
 // thing omp has no native equivalent for: scoring an otherwise-allowed tool call through a model.
 //
 // A single `tool_call` hook evaluates every rule whose `tools` match, in ONE classifier request:
-//   stage 1  a native judge (the `judge` role) scores each rule's risk in [0, 1];
+//   stage 1  a native judge (the `judge` role) answers each rule's allow/ask/block question;
+//            risk = 1 - P(allow), and P(block) is what can hard-block;
 //   stage 2  for a rule whose risk lands in its unsure band [allowBelow, askAbove), a chat model
 //            (the `llm` role) gives a 3-way allow/ask/block verdict for the whole call.
 // The worst verdict across rules wins; the tripped rule's `description` + risk is the reason shown.
@@ -22,6 +23,7 @@ import {
   type DeciderContext,
   type EscalationResult,
   type Model,
+  type RuleScore,
 } from "./decider.ts";
 
 export interface ToolCallEvent {
@@ -42,7 +44,7 @@ const BAND_RANK: Record<Band, number> = { allow: 0, escalate: 1, ask: 2, block: 
 // for pi-ai or a live model.
 export interface Engine {
   resolveRole(ctx: DeciderContext, roles: string[]): Model | undefined;
-  classify(ctx: DeciderContext, model: Model, rules: Rule[], state: string, timeoutMs: number): Promise<Record<string, number> | undefined>;
+  classify(ctx: DeciderContext, model: Model, rules: Rule[], state: string, timeoutMs: number): Promise<Record<string, RuleScore> | undefined>;
   escalate(ctx: DeciderContext, model: Model, state: string, maxTokens: number, timeoutMs: number): Promise<EscalationResult | undefined>;
   conversationText(ctx: DeciderContext): string | undefined;
 }
@@ -95,22 +97,31 @@ function clip(text: string, max = 200): string {
   return text;
 }
 
-// The band a rule's risk falls in. A missing score becomes "escalate" when an llm can re-check it,
-// otherwise "allow" (don't block on a rule we couldn't score).
-function bandOf(rule: Rule, risk: number | undefined, useLlm: boolean): Band {
-  if (risk === undefined) {
+// The band a rule's answer falls in: block from P(block), the rest from risk = 1 - P(allow). A
+// missing score becomes "escalate" when an llm can re-check it, otherwise "allow" (don't stop a
+// call on a rule we couldn't score).
+function bandOf(rule: Rule, score: RuleScore | undefined, useLlm: boolean): Band {
+  if (score === undefined) {
     return useLlm ? "escalate" : "allow";
   }
-  if (rule.blockAbove !== undefined && risk > rule.blockAbove) {
+  if (rule.blockAbove !== undefined && score.pBlock !== undefined && score.pBlock >= rule.blockAbove) {
     return "block";
   }
-  if (risk >= rule.askAbove) {
+  if (score.risk >= rule.askAbove) {
     return "ask";
   }
-  if (risk >= rule.allowBelow) {
+  if (score.risk >= rule.allowBelow) {
     return "escalate";
   }
   return "allow";
+}
+
+function formatScore(score: RuleScore | undefined): string {
+  if (score === undefined) {
+    return "?";
+  }
+  const block = score.pBlock === undefined ? "" : ` P(block)=${score.pBlock.toFixed(3)}`;
+  return `risk=${score.risk.toFixed(3)}${block}`;
 }
 
 function emitDebug(config: Config, ctx: DeciderContext, message: string): void {
@@ -209,8 +220,8 @@ export async function decide(config: Config, engine: Engine, event: ToolCallEven
   }
 
   // Stage 1: the classifier scores every matching rule in one request.
-  let scores: Record<string, number> | undefined;
-  let driver: { rule: Rule; risk: number } | undefined;
+  let scores: Record<string, RuleScore> | undefined;
+  let driver: { rule: Rule; risk: number; pBlock?: number } | undefined;
   let needLlm = !useJudge; // llm-only: escalate every in-scope call straight to the llm
 
   if (useJudge) {
@@ -219,17 +230,18 @@ export async function decide(config: Config, engine: Engine, event: ToolCallEven
       scores = await engine.classify(ctx, judgeModel, matching, state, config.timeoutMs);
     }
     if (scores) {
-      emitDebug(config, ctx, `stage 1: ${matching.map((r) => `${r.name}=${scores?.[r.name] === undefined ? "?" : scores[r.name].toFixed(3)}`).join(" ")}`);
+      emitDebug(config, ctx, `stage 1: ${matching.map((r) => `${r.name} ${formatScore(scores?.[r.name])}`).join(", ")}`);
       let worst: Band = "allow";
       for (const rule of matching) {
-        const risk = scores[rule.name];
-        const band = bandOf(rule, risk, useLlm);
+        const score = scores[rule.name];
+        const risk = score?.risk;
+        const band = bandOf(rule, score, useLlm);
         if (band === "allow") {
           continue;
         }
         const better = BAND_RANK[band] > BAND_RANK[worst] || (BAND_RANK[band] === BAND_RANK[worst] && driver !== undefined && (risk ?? rule.askAbove) > driver.risk);
         if (BAND_RANK[band] > BAND_RANK[worst] || driver === undefined || better) {
-          driver = { rule, risk: risk ?? rule.askAbove };
+          driver = { rule, risk: risk ?? rule.askAbove, pBlock: score?.pBlock };
         }
         if (BAND_RANK[band] > BAND_RANK[worst]) {
           worst = band;
@@ -240,8 +252,8 @@ export async function decide(config: Config, engine: Engine, event: ToolCallEven
         return undefined;
       }
       if (worst === "block") {
-        const reason = `${driver!.rule.description} (risk ${driver!.risk.toFixed(2)})`;
-        emitDebug(config, ctx, `block — ${driver!.rule.name} risk ${driver!.risk.toFixed(3)} > blockAbove`);
+        const reason = `${driver!.rule.description} (P(block) ${(driver!.pBlock ?? 0).toFixed(2)})`;
+        emitDebug(config, ctx, `block — ${driver!.rule.name} P(block) ${(driver!.pBlock ?? 0).toFixed(3)} >= blockAbove`);
         return blockResult(reason);
       }
       if (worst === "ask") {

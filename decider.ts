@@ -4,10 +4,17 @@
 // pi-ai is a peer module provided by the omp host and is imported lazily, so loading the plugin
 // never depends on it being resolvable before a real decision is made.
 
-import { DEFAULT_DECISION_CRITERIA, DEFAULT_DECISION_INSTRUCTIONS, type Rule } from "./config.ts";
+import { DEFAULT_ANSWERS, DEFAULT_QUESTION, type Rule } from "./config.ts";
 
 export type Model = Record<string, unknown>;
 export type Verdict = "allow" | "ask" | "block";
+
+// One rule's answer: risk = 1 - P(allow) drives allow / escalate / ask; pBlock = P(block) drives
+// block (undefined when the rule has no block answer).
+export interface RuleScore {
+  risk: number;
+  pBlock?: number;
+}
 
 export interface EscalationResult {
   verdict: Verdict;
@@ -129,34 +136,27 @@ export function resolveRole(ctx: DeciderContext, roles: string[]): Model | undef
   return ctx.model;
 }
 
-// The risk a single rule's answer implies: P(yes) for a noul, 1 - P(allow) for a choice. Undefined
-// when the answer is missing or malformed.
-export function readRuleRisk(rule: Rule, answer: unknown): number | undefined {
+const isProbability = (value: unknown): value is number => typeof value === "number" && value >= 0 && value <= 1;
+
+// Reads one rule's choice answer. Undefined when the answer is missing or malformed.
+export function readRuleScore(rule: Rule, answer: unknown): RuleScore | undefined {
   if (typeof answer !== "object" || answer === null) {
     return undefined;
   }
-  if (rule.type === "choice") {
-    const probs = (answer as { probabilities?: Record<string, unknown> }).probabilities;
-    const allow = probs ? probs.allow : undefined;
-    return typeof allow === "number" && allow >= 0 && allow <= 1 ? 1 - allow : undefined;
+  const probs = (answer as { probabilities?: Record<string, unknown> }).probabilities;
+  if (!probs || !isProbability(probs.allow)) {
+    return undefined;
   }
-  const noul = (answer as { noul?: unknown }).noul;
-  return typeof noul === "number" && noul >= 0 && noul <= 1 ? noul : undefined;
+  const score: RuleScore = { risk: 1 - probs.allow };
+  if (rule.answers.block !== undefined && isProbability(probs.block)) {
+    score.pBlock = probs.block;
+  }
+  return score;
 }
 
+// Every rule is one choice question: its answers are the options, each with its meaning.
 function buildQuestion(rule: Rule): Record<string, unknown> {
-  if (rule.type === "choice") {
-    return {
-      type: "choice",
-      instructions: rule.instructions ?? DEFAULT_DECISION_INSTRUCTIONS,
-      criteria: rule.criteria ?? DEFAULT_DECISION_CRITERIA,
-    };
-  }
-  const question: Record<string, unknown> = { type: "noul", instructions: rule.question ?? "" };
-  if (typeof rule.yes === "string" && typeof rule.no === "string") {
-    question.criteria = { true: rule.yes, false: rule.no };
-  }
-  return question;
+  return { type: "choice", instructions: rule.question, criteria: { ...rule.answers } };
 }
 
 // Stage 1: score every rule in ONE request, keyed by rule name. Returns a partial score map, or
@@ -168,7 +168,7 @@ export async function classify(
   rules: Rule[],
   state: string,
   timeoutMs: number,
-): Promise<Record<string, number> | undefined> {
+): Promise<Record<string, RuleScore> | undefined> {
   const registry = ctx.modelRegistry;
   if (!registry) {
     return undefined;
@@ -200,11 +200,11 @@ export async function classify(
     const judge = ai.createNativeJudge(model, { apiKey });
     const result = await judge.judge({ state, questions }, { signal: combineSignals(ctx.signal, timeoutMs) });
     const answers = result.answers ?? {};
-    const scores: Record<string, number> = {};
+    const scores: Record<string, RuleScore> = {};
     for (const rule of rules) {
-      const risk = readRuleRisk(rule, answers[rule.name]);
-      if (risk !== undefined) {
-        scores[rule.name] = risk;
+      const score = readRuleScore(rule, answers[rule.name]);
+      if (score !== undefined) {
+        scores[rule.name] = score;
       }
     }
     return scores;
@@ -215,9 +215,9 @@ export async function classify(
 
 const CRITERIA_TEXT =
   `Classify the call as one of:\n` +
-  `- ALLOW: ${DEFAULT_DECISION_CRITERIA.allow}\n` +
-  `- ASK: ${DEFAULT_DECISION_CRITERIA.ask}\n` +
-  `- BLOCK: ${DEFAULT_DECISION_CRITERIA.block}`;
+  `- ALLOW: ${DEFAULT_ANSWERS.allow}\n` +
+  `- ASK: ${DEFAULT_ANSWERS.ask}\n` +
+  `- BLOCK: ${DEFAULT_ANSWERS.block}`;
 
 // Parses the chat model's reply into a 3-way verdict and a short reason. Defaults to "ask" when the
 // reply can't be read (conservative — a human confirms).
@@ -275,7 +275,7 @@ export async function escalate(
   }
 
   const prompt =
-    `${DEFAULT_DECISION_INSTRUCTIONS}\n\n${CRITERIA_TEXT}\n\n${state}\n\n` +
+    `${DEFAULT_QUESTION}\n\n${CRITERIA_TEXT}\n\n${state}\n\n` +
     `First output a line exactly 'VERDICT: ALLOW', 'VERDICT: ASK', or 'VERDICT: BLOCK', then one sentence why.`;
   const messages = [{ role: "user", content: prompt, timestamp: Date.now() }];
 
